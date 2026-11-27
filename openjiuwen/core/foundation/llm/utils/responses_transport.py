@@ -27,6 +27,7 @@ from openjiuwen.core.foundation.llm.utils.responses_utils import (
     message_from_stream_chunk,
     OpenAIAccountResponsesError,
     parse_sse_block,
+    ResponsesStreamInterruptedError,
     ResponsesStreamParser,
     raise_for_http_error,
 )
@@ -92,7 +93,14 @@ class OpenAIAccountResponsesTransport:
         session_id: Optional[str] = None,
         extra_headers: Optional[dict[str, str]] = None,
     ) -> AsyncIterator[AssistantMessageChunk]:
-        """Stream response chunks from the Responses API."""
+        """Stream response chunks from the Responses API.
+
+        Raises:
+            ResponsesStreamInterruptedError: When the stream breaks before its closing
+                event: the connection drops, the stream ends early, or an event is garbled.
+            OpenAIAccountResponsesError: When the request is refused, or the stream
+                reports a failed or cancelled response.
+        """
         stream_body = dict(body)
         stream_body["stream"] = True
         effective_model = model_name or str(body.get("model") or "")
@@ -123,20 +131,40 @@ class OpenAIAccountResponsesTransport:
             )
             parser = ResponsesStreamParser(model_name=effective_model)
             buffer: list[str] = []
-            async for line in response.aiter_lines():
-                if line == "":
-                    event = parse_sse_block(buffer)
-                    buffer = []
-                    chunk = parser.parse(event)
+            try:
+                async for line in response.aiter_lines():
+                    if line == "":
+                        chunk = _parse_block(parser, buffer)
+                        buffer = []
+                        if chunk:
+                            yield chunk
+                    else:
+                        buffer.append(line)
+                if buffer:
+                    chunk = _parse_block(parser, buffer)
                     if chunk:
                         yield chunk
-                else:
-                    buffer.append(line)
-            if buffer:
-                event = parse_sse_block(buffer)
-                chunk = parser.parse(event)
-                if chunk:
-                    yield chunk
+            except ResponsesStreamInterruptedError as exc:
+                # A garbled event: parse_sse_block cannot know what came before it.
+                exc.partial = parser.partial_output()
+                raise
+            except httpx.TransportError as exc:
+                # A drop after the closing event loses nothing.
+                if not parser.finished:
+                    raise ResponsesStreamInterruptedError(
+                        f"Responses stream connection was lost before the response finished "
+                        f"({_describe_transport_error(exc)}).",
+                        reason=ResponsesStreamInterruptedError.CONNECTION_LOST,
+                        partial=parser.partial_output(),
+                    ) from exc
+            if not parser.finished:
+                # Without its closing event the reply may be cut short, for example in the
+                # middle of a tool call's arguments, so it must not count as an answer.
+                raise ResponsesStreamInterruptedError(
+                    "Responses stream ended before its closing event (response.completed).",
+                    reason=ResponsesStreamInterruptedError.MISSING_CLOSING_EVENT,
+                    partial=parser.partial_output(),
+                )
 
     async def aclose(self) -> None:
         """Close the cached HTTP client, if one has been created."""
@@ -174,3 +202,15 @@ class OpenAIAccountResponsesTransport:
                 retries=self._max_retries,
             )
         return httpx.AsyncClient(**kwargs)
+
+
+def _parse_block(parser: ResponsesStreamParser, lines: list[str]) -> Optional[AssistantMessageChunk]:
+    """Parse one SSE block; blocks after the closing event are ignored, even garbled ones."""
+    if parser.finished:
+        return None
+    return parser.parse(parse_sse_block(lines))
+
+
+def _describe_transport_error(exc: httpx.TransportError) -> str:
+    detail = str(exc).strip()
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__

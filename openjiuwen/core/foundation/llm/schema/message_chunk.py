@@ -1,7 +1,7 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import ConfigDict
 
@@ -176,20 +176,18 @@ class AssistantMessageChunk(AssistantMessage, BaseMessageChunk):
 
         if other.tool_calls:
             for incoming in other.tool_calls:
-                if merged_tool_calls:
-                    last = merged_tool_calls[-1]
-                    same_id = (last.id and incoming.id and last.id == incoming.id) or (not last.id or not incoming.id)
-                    if (same_id and hasattr(last, 'type') and last.type == 'function'
-                            and hasattr(incoming, 'type') and incoming.type == 'function'):
-                        merged_tool_calls[-1] = ToolCall(
-                            id=last.id or incoming.id,
-                            type=last.type or incoming.type,
-                            name=(last.name if last.name else incoming.name) or "",
-                            arguments=(last.arguments or "") + (incoming.arguments or ""),
-                            index=last.index,
-                            response_item_id=last.response_item_id or incoming.response_item_id,
-                        )
-                        continue
+                position = _tool_call_merge_position(merged_tool_calls, incoming)
+                if position is not None:
+                    current = merged_tool_calls[position]
+                    merged_tool_calls[position] = ToolCall(
+                        id=current.id or incoming.id,
+                        type=current.type or incoming.type,
+                        name=(current.name if current.name else incoming.name) or "",
+                        arguments=(current.arguments or "") + (incoming.arguments or ""),
+                        index=current.index,
+                        response_item_id=current.response_item_id or incoming.response_item_id,
+                    )
+                    continue
                 # otherwise, push as a new tool_call
                 merged_tool_calls.append(ToolCall(
                     id=incoming.id,
@@ -254,6 +252,28 @@ class AssistantMessageChunk(AssistantMessage, BaseMessageChunk):
         if self.reasoning_content:
             return True
         return any(call.name or call.arguments for call in self.tool_calls or ())
+
+
+def _tool_call_merge_position(merged: list[ToolCall], incoming: ToolCall) -> Optional[int]:
+    """Return the position of the call that ``incoming`` continues, or None if it starts a new call.
+
+    Responses API fragments carry their item id (``response_item_id``), so a fragment joins the
+    call with the same item id wherever it is: calls written at the same time can interleave.
+    Chat Completions fragments have no item id and join the last call, as before.
+    """
+    if incoming.response_item_id:
+        for position, call in enumerate(merged):
+            if call.response_item_id == incoming.response_item_id:
+                return position
+        return None
+    if not merged:
+        return None
+    last = merged[-1]
+    same_id = (last.id and incoming.id and last.id == incoming.id) or (not last.id or not incoming.id)
+    if (same_id and hasattr(last, 'type') and last.type == 'function'
+            and hasattr(incoming, 'type') and incoming.type == 'function'):
+        return len(merged) - 1
+    return None
 
 
 def _concat_token_ids(left: Any, right: Any) -> Any:

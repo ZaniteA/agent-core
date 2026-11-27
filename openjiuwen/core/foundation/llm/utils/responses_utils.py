@@ -28,19 +28,65 @@ from openjiuwen.core.foundation.tool import ToolInfo
 
 # Cap for provider error metadata copied into error text (e.g. OpenRouter's error.metadata.raw).
 _MAX_ERROR_METADATA_CHARS = 500
+# Caps for the error raised on a stream event that is not valid JSON.
+_MAX_GARBLED_EVENT_MESSAGE_CHARS = 500
+_MAX_GARBLED_EVENT_SAMPLE_CHARS = 200
 
 
 class OpenAIAccountResponsesError(Exception):
-    """Raised when Responses API data cannot be prepared or parsed."""
+    """Raised when Responses API data cannot be prepared or parsed.
 
-    def __init__(self, message: str, *, status_code: Optional[int] = None, body: Any = None):
+    ``details`` is optional extra information for retry logic. For example,
+    ``{"should_retry": False}`` tells the model-call retry rail not to retry.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        body: Any = None,
+        details: Optional[dict[str, Any]] = None,
+    ):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.body = body
+        self.details = details
 
     def __str__(self) -> str:
         return self.message
+
+
+class ResponsesStreamInterruptedError(OpenAIAccountResponsesError):
+    """Raised when a Responses stream breaks before its closing event.
+
+    ``reason`` says how the stream broke:
+
+    - :attr:`CONNECTION_LOST`: the connection dropped while the reply was streaming.
+    - :attr:`MISSING_CLOSING_EVENT`: the stream ended without ``response.completed``
+      or ``response.incomplete``.
+    - :attr:`GARBLED_EVENT`: an event could not be read.
+
+    ``partial`` holds what the stream delivered before it broke (text, reasoning
+    and tool calls merged into one chunk), or None if nothing arrived. The reply
+    is unfinished, so it must not be used as an answer.
+    """
+
+    CONNECTION_LOST = "connection_lost"
+    MISSING_CLOSING_EVENT = "missing_closing_event"
+    GARBLED_EVENT = "garbled_event"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        partial: Optional[AssistantMessageChunk] = None,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.partial = partial
 
 
 def build_request_body(
@@ -258,11 +304,22 @@ class ResponsesStreamParser:
     ``response.function_call_arguments.delta`` extends it), so a long tool
     call shows progress instead of arriving all at once when its item
     completes; that progress is what time to first token and the stream idle
-    timeout observe. ``response.output_item.done`` repeats the full arguments,
-    and streamed chunks are concatenated downstream, so the parser remembers
-    what it already emitted per item and the done event only contributes the
-    part that was never streamed. A backend that skips the delta events still
-    yields the complete call from the done event.
+    timeout observe. ``response.output_item.done`` repeats the full item, and
+    streamed chunks are concatenated downstream, so the parser remembers what
+    it already emitted per item and the done event only contributes the part
+    that was never streamed. This holds for tool-call arguments, answer text
+    (including refusals) and reasoning, so a backend that skips the delta
+    events (Qwen sends tool-call arguments only at the end of the item) still
+    yields the complete item from the done event.
+
+    Each tool-call fragment carries its item id (``ToolCall.response_item_id``),
+    so calls written at the same time are merged by id, not by position.
+    Reasoning parts (summary parts, ``reasoning_text`` parts, reasoning items)
+    are separated by a newline, as :func:`parse_response` joins them.
+
+    The stream ends with ``response.completed`` or ``response.incomplete``
+    (:attr:`finished`); later events are ignored. ``response.failed``, ``error``
+    and ``response.cancelled`` raise :class:`OpenAIAccountResponsesError`.
 
     One parser instance serves exactly one response stream.
     """
@@ -271,9 +328,29 @@ class ResponsesStreamParser:
         self._model_name = model_name
         # Response item id -> (tool call id, arguments emitted so far).
         self._streamed_calls: dict[str, tuple[str, str]] = {}
+        # Response item id -> position of the call among this response's function calls.
+        self._call_indexes: dict[str, int] = {}
+        self._call_count = 0
         # Whether a function call was emitted, so the terminal event can report
         # ``tool_calls`` as Chat Completions does.
         self._has_function_call = False
+        # Item key -> text pieces emitted for that message or reasoning item.
+        self._streamed_text: dict[str, list[str]] = {}
+        self._streamed_reasoning: dict[str, list[str]] = {}
+        # The reasoning part the last reasoning delta belonged to; a new part starts on a new line.
+        self._reasoning_part: Optional[tuple[str, str, Any]] = None
+        self._reasoning_emitted = False
+        self._finished = False
+        self._partial = _PartialOutput()
+
+    @property
+    def finished(self) -> bool:
+        """Whether the closing event (``response.completed`` or ``response.incomplete``) was parsed."""
+        return self._finished
+
+    def partial_output(self) -> Optional[AssistantMessageChunk]:
+        """Return what this stream has delivered so far as one chunk, or None if nothing came."""
+        return self._partial.chunk()
 
     def parse(self, event: Optional[dict[str, Any]]) -> Optional[AssistantMessageChunk]:
         """Turn one Responses SSE event into an ``AssistantMessageChunk``.
@@ -282,19 +359,25 @@ class ResponsesStreamParser:
             event: One decoded SSE event, or None for an empty block.
 
         Returns:
-            The chunk the event contributes, or None when it carries nothing.
+            The chunk the event contributes, or None when it carries nothing
+            or arrives after the closing event.
 
         Raises:
-            OpenAIAccountResponsesError: When the event reports a failed response.
+            OpenAIAccountResponsesError: When the event reports a failed or cancelled response.
         """
-        if not event:
+        if not event or self._finished:
             return None
+        chunk = self._parse_event(event)
+        if chunk is not None:
+            self._partial.add(chunk)
+        return chunk
 
+    def _parse_event(self, event: dict[str, Any]) -> Optional[AssistantMessageChunk]:
         event_type = str(event.get("type") or event.get("event") or "")
         if event_type in {"response.output_text.delta", "response.refusal.delta"}:
-            return _text_delta_chunk(event)
+            return self._text_delta_chunk(event)
         if event_type in {"response.reasoning_text.delta", "response.reasoning_summary_text.delta"}:
-            return _reasoning_delta_chunk(event)
+            return self._reasoning_delta_chunk(event, event_type=event_type)
         if event_type == "response.output_item.added":
             return self._added_function_call_chunk(event)
         if event_type == "response.function_call_arguments.delta":
@@ -302,6 +385,7 @@ class ResponsesStreamParser:
         if event_type == "response.output_item.done":
             return self._done_output_item_chunk(event)
         if event_type in {"response.completed", "response.incomplete"}:
+            self._finished = True
             return _terminal_stream_chunk(
                 event,
                 event_type=event_type,
@@ -310,7 +394,38 @@ class ResponsesStreamParser:
             )
         if event_type in {"response.failed", "error"}:
             raise OpenAIAccountResponsesError(_stream_error_message(event))
+        if event_type == "response.cancelled":
+            # Someone stopped this response on purpose; asking again would not help.
+            raise OpenAIAccountResponsesError(
+                "Responses stream was cancelled before the response finished.",
+                details={"should_retry": False},
+            )
         return None
+
+    def _text_delta_chunk(self, event: dict[str, Any]) -> Optional[AssistantMessageChunk]:
+        delta = str(event.get("delta") or "")
+        if not delta:
+            return None
+        self._streamed_text.setdefault(_delta_item_key(event), []).append(delta)
+        return AssistantMessageChunk(content=delta, finish_reason="null")
+
+    def _reasoning_delta_chunk(self, event: dict[str, Any], *, event_type: str) -> Optional[AssistantMessageChunk]:
+        delta = str(event.get("delta") or "")
+        if not delta:
+            return None
+        key = _delta_item_key(event)
+        index_field = "summary_index" if event_type == "response.reasoning_summary_text.delta" else "content_index"
+        part = (key, event_type, event.get(index_field))
+        separator = "\n" if self._reasoning_emitted and part != self._reasoning_part else ""
+        item_pieces = self._streamed_reasoning.get(key)
+        if item_pieces is None:
+            # A separator before an item's first part sits between items, not inside this one.
+            self._streamed_reasoning[key] = [delta]
+        else:
+            item_pieces.extend((separator, delta))
+        self._reasoning_part = part
+        self._reasoning_emitted = True
+        return AssistantMessageChunk(content="", reasoning_content=separator + delta, finish_reason="null")
 
     def _added_function_call_chunk(self, event: dict[str, Any]) -> Optional[AssistantMessageChunk]:
         item = event.get("item")
@@ -321,7 +436,7 @@ class ResponsesStreamParser:
             # Without an item id the deltas cannot be attributed; the done
             # event will deliver the whole call instead.
             return None
-        tool_call = _tool_call_from_response_item(item, index=0)
+        tool_call = _tool_call_from_response_item(item, index=self._call_index(item_id))
         initial_arguments = _json_argument_string(item.get("arguments") or "")
         tool_call.arguments = initial_arguments
         self._streamed_calls[item_id] = (tool_call.id or "", initial_arguments)
@@ -344,7 +459,7 @@ class ResponsesStreamParser:
                     type="function",
                     name="",
                     arguments=delta,
-                    index=0,
+                    index=self._call_index(item_id),
                     response_item_id=item_id,
                 ),
             ],
@@ -353,11 +468,30 @@ class ResponsesStreamParser:
 
     def _done_output_item_chunk(self, event: dict[str, Any]) -> Optional[AssistantMessageChunk]:
         item = event.get("item")
-        if not isinstance(item, dict) or item.get("type") != "function_call":
+        if not isinstance(item, dict):
             return None
+        item_type = item.get("type")
+        if item_type == "function_call":
+            return self._done_function_call_chunk(item)
+        if item_type == "message":
+            streamed = _pop_streamed(self._streamed_text, event, item)
+            rest = _unstreamed_rest(streamed, "".join(_message_content_text(item)), item=item)
+            return AssistantMessageChunk(content=rest, finish_reason="null") if rest else None
+        if item_type == "reasoning":
+            streamed = _pop_streamed(self._streamed_reasoning, event, item)
+            rest = _unstreamed_rest(streamed, "\n".join(_reasoning_text(item)), item=item)
+            if not rest:
+                return None
+            if streamed is None and self._reasoning_emitted:
+                rest = "\n" + rest
+            self._reasoning_part = None
+            self._reasoning_emitted = True
+            return AssistantMessageChunk(content="", reasoning_content=rest, finish_reason="null")
+        return None
 
-        tool_call = _tool_call_from_response_item(item, index=0)
+    def _done_function_call_chunk(self, item: dict[str, Any]) -> AssistantMessageChunk:
         item_id = str(item.get("id") or "").strip()
+        tool_call = _tool_call_from_response_item(item, index=self._call_index(item_id))
         streamed = self._streamed_calls.pop(item_id, None)
         if streamed is not None:
             _, emitted_arguments = streamed
@@ -381,6 +515,99 @@ class ResponsesStreamParser:
             finish_reason="tool_calls",
         )
 
+    def _call_index(self, item_id: str) -> int:
+        """Position of a function call in this response, in the order calls first appeared."""
+        if item_id in self._call_indexes:
+            return self._call_indexes[item_id]
+        index = self._call_count
+        self._call_count += 1
+        if item_id:
+            self._call_indexes[item_id] = index
+        return index
+
+
+class _PartialOutput:
+    """Text, reasoning and tool calls one stream has delivered so far.
+
+    Pieces are kept in lists, so a long stream costs no repeated copying. They are
+    joined into one chunk only when a broken stream reports what it delivered.
+    """
+
+    def __init__(self) -> None:
+        self._content: list[str] = []
+        self._reasoning: list[str] = []
+        # (first fragment of the call, its argument pieces), in the order calls appeared.
+        self._calls: list[tuple[ToolCall, list[str]]] = []
+        self._call_positions: dict[str, int] = {}
+
+    def add(self, chunk: AssistantMessageChunk) -> None:
+        if isinstance(chunk.content, str) and chunk.content:
+            self._content.append(chunk.content)
+        if chunk.reasoning_content:
+            self._reasoning.append(chunk.reasoning_content)
+        for call in chunk.tool_calls or ():
+            position = self._call_positions.get(call.response_item_id) if call.response_item_id else None
+            if position is None:
+                if call.response_item_id:
+                    self._call_positions[call.response_item_id] = len(self._calls)
+                self._calls.append((call, [call.arguments]))
+            else:
+                self._calls[position][1].append(call.arguments)
+
+    def chunk(self) -> Optional[AssistantMessageChunk]:
+        if not (self._content or self._reasoning or self._calls):
+            return None
+        tool_calls = [
+            call.model_copy(update={"arguments": "".join(arguments)}) for call, arguments in self._calls
+        ]
+        return AssistantMessageChunk(
+            content="".join(self._content),
+            reasoning_content="".join(self._reasoning) or None,
+            tool_calls=tool_calls or None,
+            finish_reason="null",
+        )
+
+
+def _delta_item_key(event: dict[str, Any]) -> str:
+    """Key of the output item a delta event belongs to: its item id, else its output index."""
+    item_id = str(event.get("item_id") or "").strip()
+    if item_id:
+        return f"id:{item_id}"
+    output_index = event.get("output_index")
+    return f"index:{output_index}" if output_index is not None else ""
+
+
+def _pop_streamed(streamed: dict[str, list[str]], event: dict[str, Any], item: dict[str, Any]) -> Optional[str]:
+    """Remove and return the text already streamed for the item an ``output_item.done`` event closes.
+
+    The done event names its item by ``item.id`` and ``output_index``; deltas name it by
+    ``item_id``, else ``output_index``, else not at all, so each of those keys is tried.
+    """
+    item_id = str(item.get("id") or "").strip()
+    output_index = event.get("output_index")
+    keys = [f"id:{item_id}" if item_id else None, f"index:{output_index}" if output_index is not None else None, ""]
+    for key in keys:
+        if key is not None and key in streamed:
+            return "".join(streamed.pop(key))
+    return None
+
+
+def _unstreamed_rest(streamed: Optional[str], full: str, *, item: dict[str, Any]) -> str:
+    """Part of an item's full text that the deltas did not already deliver."""
+    if streamed is None:
+        return full
+    if full.startswith(streamed):
+        return full[len(streamed):]
+    if not streamed.startswith(full):
+        # The streamed pieces are already concatenated downstream and cannot be
+        # taken back; keep them rather than repeat the text.
+        logger.warning(
+            "Responses %s item %s text differs from the streamed deltas; keeping the streamed text.",
+            item.get("type"),
+            item.get("id"),
+        )
+    return ""
+
 
 def iter_sse_events(lines: Iterable[str]) -> Iterable[dict[str, Any]]:
     """Yield decoded event dictionaries from raw SSE lines."""
@@ -402,7 +629,12 @@ def iter_sse_events(lines: Iterable[str]) -> Iterable[dict[str, Any]]:
 
 
 def parse_sse_block(lines: list[str]) -> Optional[dict[str, Any]]:
-    """Decode a single SSE block."""
+    """Decode a single SSE block.
+
+    Raises:
+        ResponsesStreamInterruptedError: When the block's data is not valid JSON
+            (reason :attr:`ResponsesStreamInterruptedError.GARBLED_EVENT`).
+    """
     event_type = ""
     data_parts: list[str] = []
 
@@ -432,7 +664,10 @@ def parse_sse_block(lines: list[str]) -> Optional[dict[str, Any]]:
     try:
         parsed = json.loads(raw_data)
     except json.JSONDecodeError as exc:
-        raise OpenAIAccountResponsesError(f"Invalid OpenAI account SSE JSON: {raw_data}") from exc
+        raise ResponsesStreamInterruptedError(
+            _garbled_event_message(event_type, raw_data),
+            reason=ResponsesStreamInterruptedError.GARBLED_EVENT,
+        ) from exc
 
     if not isinstance(parsed, dict):
         return None
@@ -731,8 +966,12 @@ def _message_content_text(item: dict[str, Any]) -> list[str]:
     for part in content:
         if not isinstance(part, dict):
             continue
-        if part.get("type") in {"output_text", "text"} and part.get("text") is not None:
+        part_type = part.get("type")
+        if part_type in {"output_text", "text"} and part.get("text") is not None:
             texts.append(str(part.get("text")))
+        elif part_type == "refusal" and part.get("refusal") is not None:
+            # Streamed refusals (``response.refusal.delta``) are answer text too.
+            texts.append(str(part.get("refusal")))
     return texts
 
 
@@ -744,6 +983,14 @@ def _reasoning_text(item: dict[str, Any]) -> list[str]:
             if isinstance(part, str):
                 texts.append(part)
             elif isinstance(part, dict) and part.get("text") is not None:
+                texts.append(str(part.get("text")))
+
+    # Some providers (DeepSeek and GLM, for example) send readable reasoning as
+    # ``content[]`` ``reasoning_text`` parts.
+    content = item.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "reasoning_text" and part.get("text") is not None:
                 texts.append(str(part.get("text")))
 
     text = item.get("text")
@@ -763,20 +1010,6 @@ def _tool_call_from_response_item(item: dict[str, Any], *, index: int) -> ToolCa
         index=index,
         response_item_id=response_item_id,
     )
-
-
-def _text_delta_chunk(event: dict[str, Any]) -> Optional[AssistantMessageChunk]:
-    delta = str(event.get("delta") or "")
-    if not delta:
-        return None
-    return AssistantMessageChunk(content=delta, finish_reason="null")
-
-
-def _reasoning_delta_chunk(event: dict[str, Any]) -> Optional[AssistantMessageChunk]:
-    delta = str(event.get("delta") or "")
-    if not delta:
-        return None
-    return AssistantMessageChunk(content="", reasoning_content=delta, finish_reason="null")
 
 
 def _terminal_stream_chunk(
@@ -832,6 +1065,18 @@ def _stream_error_message(event: dict[str, Any]) -> str:
             message = f"{message} (metadata: {metadata})"
     code = (error or {}).get("code") or next((item["code"] for item in errors if item.get("code")), None)
     return f"Error code: {code} - {message}" if code else message
+
+
+def _garbled_event_message(event_type: str, raw_data: str) -> str:
+    """Short error text for a stream event that is not valid JSON: the event name and a short sample."""
+    name = f"'{event_type}'" if event_type else "without an event name"
+    sample = raw_data
+    if len(sample) > _MAX_GARBLED_EVENT_SAMPLE_CHARS:
+        sample = f"{sample[:_MAX_GARBLED_EVENT_SAMPLE_CHARS]}... [{len(raw_data)} chars]"
+    message = f"Responses stream event {name} is not valid JSON: {sample}"
+    if len(message) > _MAX_GARBLED_EVENT_MESSAGE_CHARS:
+        message = f"{message[:_MAX_GARBLED_EVENT_MESSAGE_CHARS - 3]}..."
+    return message
 
 
 def _error_metadata_summary(*sources: Any) -> Optional[str]:

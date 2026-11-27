@@ -52,8 +52,11 @@ def _gateway_error(route, message, *, status=400, **fields):
 def _completion(route, model):
     content = '{"description":"Extract text from a document.","inputs":[],"outputs":[]}'
     if route.startswith("responses"):
-        event = "event: response.output_text.delta\ndata: " + json.dumps({"delta": content}) + "\n\n"
-        return httpx.Response(200, text=event, headers={"Content-Type": "text/event-stream"})
+        events = (
+            "event: response.output_text.delta\ndata: " + json.dumps({"delta": content}) + "\n\n"
+            "event: response.completed\ndata: " + json.dumps({"response": {"status": "completed"}}) + "\n\n"
+        )
+        return httpx.Response(200, text=events, headers={"Content-Type": "text/event-stream"})
     if route == "messages":
         return httpx.Response(200, json={
             "id": "msg-1", "type": "message", "role": "assistant", "model": model,
@@ -293,7 +296,7 @@ async def test_responses_does_not_restart_after_receiving_sse(make_model):
     model = make_model("responses", respond)
     chunks = []
     with disabled_thinking_fallback_scope():
-        with pytest.raises(BaseError, match="Invalid OpenAI account SSE JSON"):
+        with pytest.raises(BaseError, match="Responses stream event 'error' is not valid JSON"):
             async for chunk in model.stream("extract", temperature=0, send_sampling_params=True):
                 chunks.append(chunk.content)
 

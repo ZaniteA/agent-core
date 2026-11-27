@@ -12,7 +12,11 @@ import pytest
 from openjiuwen.core.foundation.llm import ModelClientConfig, ModelRequestConfig
 from openjiuwen.core.foundation.llm.model_clients.openai_model_client import OpenAIModelClient
 from openjiuwen.core.foundation.llm.utils.responses_transport import OpenAIAccountResponsesTransport
-from openjiuwen.core.foundation.llm.utils.responses_utils import build_request_body, parse_response
+from openjiuwen.core.foundation.llm.utils.responses_utils import (
+    ResponsesStreamInterruptedError,
+    build_request_body,
+    parse_response,
+)
 
 _MODEL = "gpt-5.6-luna"
 _CALL = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "save_note", "arguments": ""}
@@ -130,15 +134,13 @@ async def test_raw_incomplete_reason_stays_in_provider_metadata():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("events", "expected"),
-    [([_call_done()], "tool_calls"), ([_text()], "stop")],
-    ids=["tool_call", "text"],
-)
-async def test_invoke_without_terminal_event_is_unchanged(events, expected):
-    message = await _transport(events).create_response(body=_body(), access_token="token")
+@pytest.mark.parametrize("events", [[_call_done()], [_text()]], ids=["tool_call", "text"])
+async def test_invoke_without_terminal_event_raises_interrupted(events):
+    """A stream that stops before its closing event may be cut short, so it is not a finished answer."""
+    with pytest.raises(ResponsesStreamInterruptedError) as exc_info:
+        await _transport(events).create_response(body=_body(), access_token="token")
 
-    assert message.finish_reason == expected
+    assert exc_info.value.reason == ResponsesStreamInterruptedError.MISSING_CLOSING_EVENT
 
 
 def _responses_client() -> OpenAIModelClient:

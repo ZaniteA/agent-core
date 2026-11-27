@@ -20,6 +20,7 @@ from openjiuwen.core.foundation.llm.utils.responses_utils import (
     parse_sse_block,
     ResponsesStreamParser,
     raise_for_http_error,
+    ResponsesStreamInterruptedError,
 )
 from openjiuwen.core.foundation.llm.utils.responses_transport import OpenAIAccountResponsesTransport
 from openjiuwen.core.foundation.llm.utils.provider_error import (
@@ -45,6 +46,7 @@ __all__ = [
     "parse_sse_block",
     "ResponsesStreamParser",
     "raise_for_http_error",
+    "ResponsesStreamInterruptedError",
     "OpenAIAccountResponsesTransport",
     "MAX_PROVIDER_ERROR_CHARS",
     "format_provider_exception",
