@@ -22,6 +22,7 @@ generated: true
 | [agent_teams/memory](#module-agent_teams-memory) |
 | [agent_teams/observability](#module-agent_teams-observability) |
 | [agent_teams/workflow](#module-agent_teams-workflow) |
+| [core](#module-core) |
 | [core.extension](#module-core-extension) |
 | [core.runner.resources_manager](#module-core-runner-resources_manager) |
 | [core.session.tracer](#module-core-session-tracer) |
@@ -361,6 +362,14 @@ generated: true
 | [SDD-0031](designs/proposals/SDD-0031-teammate-swarmflow-orchestration/design.md) | D | 集群模式teammate支持swarmflow工具 | @xiajing | — |
 | [B_20261102_1120_avatar-child-session-trace-root](bugfix/agent_teams/B_20261102_1120_avatar-child-session-trace-root.md) | B | Swarmflow avatar child session 找不到 Team 轨迹 root | wangcan103 | 无独立 D：普通缺陷修复；沿用 S_18 的 session 隔离契约，无独立设计 |
 
+<a id="module-core"></a>
+
+## core
+
+| ID / 文档 | 类型 | 标题 | 作者 | 关联 D |
+|---|---|---|---|---|
+| [B_20261127_1146_browser-screenshots-reach-model](bugfix/harness/B_20261127_1146_browser-screenshots-reach-model.md) | B | Browser screenshots never reached vision models | AlbertYulius | D-20261127-1102-responses-native-support（非本仓或待定位） |
+
 <a id="module-core-extension"></a>
 
 ## core.extension
@@ -588,6 +597,7 @@ generated: true
 | [B_20261111_2006_sandbox-shell-output](bugfix/harness/B_20261111_2006_sandbox-shell-output.md) | B | 本地沙箱内回读 Shell 超长输出 | 羿寒 王 | 无独立 D：按已确认的沙箱内存储方案修复现有工具结果回读契约。 |
 | [B_20261114_1107_interactive-memory-turn](bugfix/harness/B_20261114_1107_interactive-memory-turn.md) | B | 交互式中断恢复后记忆丢失修复 | robin1217 | 无独立 D：本次按对话中确认的 D3 收敛方案修复，未建立独立 D 文档；外部 F08 的 D3 是决策编号，不是设计资产标识。 |
 | [B_20261126_2055_lsp-client-crash-reporting](bugfix/harness/B_20261126_2055_lsp-client-crash-reporting.md) | B | LSP 客户端 EOF 崩溃不上报、超时请求条目泄漏与 Windows 文件 URI 未编码 | linghb | 无独立 D：对 LSP 客户端通信层的三处确定性缺陷修复，不改变对外契约，无需独立设计。 |
+| [B_20261127_1146_browser-screenshots-reach-model](bugfix/harness/B_20261127_1146_browser-screenshots-reach-model.md) | B | Browser screenshots never reached vision models | AlbertYulius | D-20261127-1102-responses-native-support（非本仓或待定位） |
 | [S_01_public-api-and-construction](specs/harness/S_01_public-api-and-construction.md) | S | S_01 公开 API 表面与构造流 | yangzequ | — |
 | [S_02_deep-agent-architecture](specs/harness/S_02_deep-agent-architecture.md) | S | S_02 DeepAgent 架构 | yangzequ | — |
 | [S_03_task-loop](specs/harness/S_03_task-loop.md) | S | S_03 TaskLoop 事件体系 | yangzequ | — |

@@ -55,7 +55,9 @@ Create the browser sub-agent. On top of a plain deep agent, this factory:
 1. Resolves the requested `browser_capabilities` against the trusted capability catalog (unknown names raise `ValueError` listing the available capabilities).
 2. Builds a [`BrowserAgentRuntime`](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeruntimebrowseragentruntime) from `settings` (or from the model's client config / environment when `settings` is omitted).
 3. Appends the [runtime helper tools](../tools/browser_tools.md#runtime-helper-tools) to any caller-provided `tools`.
-4. Appends a [`BrowserRuntimeRail`](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeruntimebrowserruntimerail) to any caller-provided `rails`.
+4. Appends a [`BrowserRuntimeRail`](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeruntimebrowserruntimerail) to any caller-provided `rails`, plus a `MultimodalContextSummarizerRail` that keeps only the 3 latest screenshots as images in the context (skipped when the caller already passes one).
+
+When the model accepts images, `browser_take_screenshot` is offered and its screenshot is sent to the model as an image. Otherwise the tool is hidden and the system prompt tells the model not to take screenshots.
 
 The default system prompt (locale-specific, `cn`/`en`) instructs the agent to prefer compact probes over snapshots, to use `browser_run_code` only with a known selector, and to claim completion only when the outcome is evidenced on the page.
 

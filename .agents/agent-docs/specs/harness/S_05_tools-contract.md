@@ -18,7 +18,7 @@ author_email: yangzequ1@huawei.com
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/tools/`（130 文件）、`openjiuwen/harness/schema/task.py`、`openjiuwen/core/foundation/tool/base.py`（`Tool.render_for_llm`） |
-| 最近一次修订日期 | 2026-11-12 |
+| 最近一次修订日期 | 2026-11-27 |
 | 关联 feature | `F_04_tool-result-llm-rendering.md`、`F_05_browser-task-integrity.md`、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_21_cua-desktop-subagent、F_23_progressive-tool-discovery-metadata、F_20261104_1720_tool-execution-environment |
 
 ## 范围 / 边界
@@ -151,7 +151,8 @@ i18n、工具生命周期。`tools/` 是 harness 最大的子模块（130 文件
     `ToolMessage` 时对工具实例调用 `render_for_llm(result)`；结构化结果原样留在
     `ToolCallInputs.tool_result` 给 rail / 事件 / 日志。默认实现（`render_tool_output`）：成功取
     `data["content"]`（`data` 为字符串直接用，无 `content` 的其它载荷序列化为 JSON），失败取
-    `error`（为空回落载荷），空结果给占位文本；非 `ToolOutput` 结果为 `str(output)`。
+    `error`（为空回落载荷），空结果给占位文本；非 `ToolOutput` 结果为 `str(output)`，
+    带 `multimodal` 列表的裸 dict 除外：去掉 `multimodal` 后按上面的载荷规则渲染，base64 不进文本。
     - `data` 没有 `content` 的工具**必须覆写** `render_for_llm` 给出纯文本，JSON 兜底只是最后防线；
       浏览器 runtime 工具例外——`BrowserRuntimeRail` 按 JSON 解析其消息，保持默认 JSON。
     - 返回裸 dict 的工具（todo / goal）不改返回形态（CLI todo 视图解析其 `str()`），只覆写渲染。
@@ -178,7 +179,8 @@ i18n、工具生命周期。`tools/` 是 harness 最大的子模块（130 文件
       `data["multimodal"]` 时，包装器把这份图片列表移到自身 `data["multimodal"]`（嵌套的
       `result` 不再带它），图片照常送达模型，且只序列化一次。
     - 工具图片走 `data["multimodal"]`（`type="image"`、`data_url`）：代理在该批工具消息之后追加
-      一条用户消息交给模型。图片项带 `"keep_in_context": False` 时，只在模型对它作出回答之前出现
+      一条用户消息交给模型。结果本身是裸 dict 时读其顶层 `multimodal`（`BrowserRuntimeRail` 把
+      结果解包为 dict；它写工具消息文本、回执和证据时先取出图片，结束后再放回）。图片项带 `"keep_in_context": False` 时，只在模型对它作出回答之前出现
       在发给模型的窗口里；之后窗口中该图片替换为一句说明文字。存储的上下文不改，失败重试、暂停
       恢复时图片仍在。不带该键的图片每次都发送。
     - 外部协议出口（team MCP server / Claude SDK MCP / skill CLI / 被动成员执行器）同样调用

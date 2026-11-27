@@ -18,7 +18,7 @@ author_email: yangzequ1@huawei.com
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/subagents/`（9 文件）、`openjiuwen/harness/tools/cua/`、`openjiuwen/harness/subagent_lifecycle.py`、`openjiuwen/harness/manifest/harness_elements.py`（subagent 构建器） |
-| 最近一次修订日期 | 2026-11-02 |
+| 最近一次修订日期 | 2026-11-27 |
 | 关联 feature | F_05_browser-task-integrity、F_07_browser-jev-policy、F_08_browser-jev-handover、F_09_browser-runtime-phase-contract、F_10_browser-runtime-simplification、F_11_browser-p0-closure、F_12_browser-jev-shared-observation、F_13_browser-local-decision-loop、F_14_browser-model-usage-summary、F_20_react-iteration-limit、F_21_cua-desktop-subagent |
 
 ## 范围 / 边界
@@ -74,6 +74,10 @@ Browser 的完整工具、Rails、运行时与宿主接入统一见
 6. **browser agent 约束**：`build_browser_agent_config` 经
    `_resolve_runtime_settings` 解析浏览器运行时；`_browser_model_with_temperature(model, temp)`
    设置浏览器模型温度；`_coerce_browser_instance` 归一实例形态。
+   Playwright MCP 配置开启 `include_image_content`，截图以图片送达视觉模型；`create_browser_agent`
+   在调用方未传入时注入 `MultimodalContextSummarizerRail`（默认保留最近 3 张截图）。
+   `BrowserRuntimeRail` 在 `before_invoke` 记下浏览器 DeepAgent 的图像支持，模型与工具回调
+   （只拿到内层 ReActAgent）复用该结果，使系统提示、Batch 截图检查与工具白名单一致。
 7. **同步创建路径**：`create_*_agent(config, ...)` 是同步（复用 `create_deep_agent` 的
    同步构造，`S_01` 不变量 3）；`enable_subagent_runtime` 时才进 `S_10` 的异步控制面。
 8. **manifest 侧预设与 `subagents/` 预设同源**：`S_12` 的 `build_*_subagent` 是
@@ -210,7 +214,7 @@ async def cleanup_subagent_task_resources(subagent: Any) -> None
 
 | preset | 构建 | 创建 | 关键装配 |
 |---|---|---|---|
-| browser | `build_browser_agent_config` | `create_browser_agent` | 浏览器 runtime settings、模型温度 |
+| browser | `build_browser_agent_config` | `create_browser_agent` | 浏览器 runtime settings、模型温度、截图窗口 |
 | code | `build_code_agent_config` | `create_code_agent` | 内置 plan agent 注入、必带 rails、coding memory 目录 |
 | research | `build_research_agent_config` | `create_research_agent` | 研究工具组 |
 | verification | `build_verification_agent_config` | `create_verification_agent` | 验证 rail / 工具 |

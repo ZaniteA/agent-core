@@ -18,7 +18,7 @@ author_email: yangzequ1@huawei.com
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/harness/rails/` |
-| 最近一次修订日期 | 2026-11-24 |
+| 最近一次修订日期 | 2026-11-27 |
 | 关联 feature | `F_01_ask-user-otel-events.md`、`F_02_genai-semconv-tool-spans.md`、`F_21_cua-desktop-subagent.md`、`F_22_cli-jiuwen-memory-rail-mount-and-switch.md` |
 
 ## 范围 / 边界
@@ -120,8 +120,8 @@ author_email: yangzequ1@huawei.com
     `MultimodalContextSummarizerRail(screenshots_to_keep=3, *, protected_user_message_names=())`
     在 `before_model_call` 中把较早的带 `image_url` 的 user 消息图像替换为
     `ARCHIVED_SCREEN_PLACEHOLDER` 文本，保留最近 `screenshots_to_keep` 条；`name` 在
-    `protected_user_message_names` 中的消息不参与计数也不被替换。cua_agent 始终使用它
-    （`S_18`）；`tools/mobile_gui/rails/multimodal_context_summarizer_rail.py` 保留原导入路径，
+    `protected_user_message_names` 中的消息不参与计数也不被替换。cua_agent 始终使用它；
+    browser_agent 在调用方未传入同类 rail 时注入默认实例（`S_18`）；`tools/mobile_gui/rails/multimodal_context_summarizer_rail.py` 保留原导入路径，
     是预置 mobile 受保护消息名的子类。
 14. **中断带 id、类型和发起者，答复只给发起它的 rail**：
     - 每个中断请求有 `interrupt_id`（中断处理器收集暂停的调用时分配，`after_tool_call` 里还没有；
