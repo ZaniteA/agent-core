@@ -130,6 +130,31 @@ def test_react_agent_labels_mcp_sourced_images() -> None:
     }
 
 
+def test_react_agent_reads_images_from_plain_dict_tool_result() -> None:
+    # Rails such as BrowserRuntimeRail unwrap a ToolOutput / McpToolResult into its data dict.
+    result = {
+        "content": "### Result\n- [Screenshot of viewport](page.png)",
+        "executed": True,
+        "multimodal": [
+            {
+                "type": "image",
+                "source": "mcp",
+                "source_path": "browser_take_screenshot",
+                "data_url": "data:image/png;base64,abc",
+            }
+        ],
+    }
+
+    messages = ReActAgent._build_multimodal_tool_result_messages(result)
+
+    assert len(messages) == 1
+    assert messages[0].content == [
+        {"type": "text", "text": "Image loaded from mcp: browser_take_screenshot"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+    ]
+    assert ReActAgent._build_multimodal_tool_result_messages({"content": "no images"}) == []
+
+
 def test_tool_message_content_uses_mcp_tool_result_content() -> None:
     from openjiuwen.core.foundation.tool import MCPTool, McpToolCard, McpToolResult
 

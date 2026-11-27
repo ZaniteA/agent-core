@@ -10,10 +10,14 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openjiuwen.core.foundation.tool import McpServerConfig
+from mcp.types import CallToolResult, ImageContent, TextContent
+
+from openjiuwen.core.foundation.tool import McpServerConfig, McpToolResult
+from openjiuwen.harness.tools.browser_move.clients.stdio_client import BrowserMoveStdioClient
 from openjiuwen.harness.tools.browser_move.clients.streamable_http_client import (
     BrowserMoveStreamableHttpClient,
 )
@@ -153,6 +157,14 @@ def test_build_playwright_mcp_config_deduplicates_capabilities() -> None:
         "@playwright/mcp@0.0.78",
         "--caps=pdf,vision,devtools,config,network,storage,testing",
     ]
+
+
+def test_build_playwright_mcp_config_asks_for_screenshot_images() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        cfg = build_playwright_mcp_config()
+
+    assert cfg.include_image_content is True
+    assert build_playwright_mcp_config(BrowserInstanceConfig(key="alpha")).include_image_content is True
 
 
 def test_parse_command_args_accepts_json_list() -> None:
@@ -305,6 +317,76 @@ def test_browser_move_streamable_http_client_accepts_config_constructor() -> Non
 
     assert client.server_path == "http://127.0.0.1:8940/mcp"
     assert client.name == "playwright-runtime-wrapper"
+
+
+_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+
+def _screenshot_session(*, is_error: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=CallToolResult(
+                isError=is_error,
+                content=[
+                    TextContent(type="text", text="### Result"),
+                    ImageContent(type="image", data=_PNG, mimeType="image/png"),
+                ],
+            )
+        )
+    )
+
+
+def _mcp_cfg(client_type: str, *, include_image_content: bool) -> McpServerConfig:
+    # Not a browser server: the patched clients serve every MCP server in the process.
+    return McpServerConfig(
+        server_id="screen-reader",
+        server_name="screen-reader",
+        server_path="stdio://screen-reader" if client_type == "stdio" else "http://127.0.0.1:8940/mcp",
+        client_type=client_type,
+        include_image_content=include_image_content,
+    )
+
+
+def test_browser_move_stdio_client_keeps_images_when_server_asks_for_them() -> None:
+    client = BrowserMoveStdioClient(_mcp_cfg("stdio", include_image_content=True))
+    client._session = _screenshot_session()
+
+    result = _run(client.call_tool("take_screenshot", {}))
+
+    assert isinstance(result, McpToolResult)
+    assert result.data["content"] == "### Result\n\n1 image(s) attached as multimodal input."
+    assert result.data["multimodal"][0]["data_url"] == f"data:image/png;base64,{_PNG}"
+    assert result.data["multimodal"][0]["source_path"] == "take_screenshot"
+
+
+def test_browser_move_stdio_client_uses_core_image_placeholder_by_default() -> None:
+    client = BrowserMoveStdioClient(_mcp_cfg("stdio", include_image_content=False))
+    client._session = _screenshot_session()
+
+    result = _run(client.call_tool("take_screenshot", {}))
+
+    assert result == f"### Result\n\n[image content: image/png, {len(_PNG)} base64 chars]"
+
+
+def test_browser_move_streamable_http_client_keeps_images_when_server_asks_for_them() -> None:
+    client = BrowserMoveStreamableHttpClient(_mcp_cfg("streamable-http", include_image_content=True))
+    client._session = _screenshot_session()
+
+    result = _run(client.call_tool("take_screenshot", {}))
+
+    assert isinstance(result, McpToolResult)
+    assert result.data["multimodal"][0]["data_url"] == f"data:image/png;base64,{_PNG}"
+
+
+def test_browser_move_streamable_http_client_reports_mcp_errors() -> None:
+    client = BrowserMoveStreamableHttpClient(_mcp_cfg("streamable-http", include_image_content=False))
+    client._session = _screenshot_session(is_error=True)
+
+    result = _run(client.call_tool("take_screenshot", {}))
+
+    assert isinstance(result, McpToolResult)
+    assert result.success is False
+    assert result.error == "### Result"
 
 
 def test_browser_move_streamable_http_client_reuses_core_transport_connect() -> None:

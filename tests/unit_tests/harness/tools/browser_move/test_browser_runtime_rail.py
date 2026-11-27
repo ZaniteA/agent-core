@@ -14,7 +14,7 @@ import pytest
 
 from openjiuwen.core.foundation.llm import ToolCall
 from openjiuwen.core.foundation.llm.schema.message import ToolMessage, UserMessage
-from openjiuwen.core.foundation.tool import McpServerConfig, ToolInfo
+from openjiuwen.core.foundation.tool import McpServerConfig, McpToolResult, ToolInfo
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.single_agent.ability_manager import AbilityManager
 from openjiuwen.core.single_agent.prompts.builder import SystemPromptBuilder
@@ -405,6 +405,69 @@ def test_before_tool_call_rejects_batch_screenshot_without_image_support() -> No
     assert ctx.inputs.tool_result["error"]["code"] == "browser_image_input_unavailable"
     assert ctx.inputs.tool_msg is not None
     assert ctx.extra["_skip_tool_calls"]
+
+
+def _invoke_on_browser_deep_agent(rail: BrowserRuntimeRail, *, image_support: bool) -> None:
+    """Run before_invoke as DeepAgent does: on the outer agent, which carries deep_config."""
+    rail._runtime.ensure_runtime_ready = AsyncMock()
+    rail._runtime.service = MagicMock()
+    rail._runtime.service.mcp_cfg = _playwright_mcp_config()
+    rail._runtime.service.allowed_tool_names = ("browser_click", "browser_take_screenshot")
+    ctx = _make_ctx()
+    ctx.agent.deep_config.enable_read_image_multimodal = image_support
+    ctx.agent.ability_manager = MagicMock()
+    _run(rail.before_invoke(ctx))
+
+
+@pytest.mark.parametrize("image_support", [True, False])
+def test_model_and_tool_hooks_use_the_browser_deep_agent_image_support(image_support: bool) -> None:
+    # Model and tool hooks receive the inner ReActAgent, which has no deep_config.
+    rail = BrowserRuntimeRail(MagicMock(spec=BrowserAgentRuntime))
+    _invoke_on_browser_deep_agent(rail, image_support=image_support)
+    builder = SystemPromptBuilder(language="en")
+    inner_agent = SimpleNamespace(system_prompt_builder=builder)
+
+    _run(rail.before_model_call(AgentCallbackContext(agent=inner_agent)))
+
+    prompt = builder.build()
+    assert ("The current model can inspect image input" in prompt) is image_support
+    assert ("Image input is unavailable or unverified" in prompt) is not image_support
+    assert rail._image_input_supported(inner_agent) is image_support
+
+
+def test_after_tool_call_keeps_screenshot_data_out_of_tool_text() -> None:
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    image = {
+        "type": "image",
+        "source": "mcp",
+        "source_path": "browser_take_screenshot",
+        "mime_type": "image/png",
+        "data_url": f"data:image/png;base64,{png}",
+    }
+    tool_result = McpToolResult(
+        data={
+            "content": "### Result\n- [Screenshot of viewport](page.png)\n\n1 image(s) attached as multimodal input.",
+            "multimodal": [image],
+        }
+    )
+    tool_message = ToolMessage(tool_call_id="shot", content=tool_result.data["content"])
+    ctx = AgentCallbackContext(
+        agent=MagicMock(),
+        inputs=ToolCallInputs(
+            tool_name="mcp_playwright-official_browser_take_screenshot",
+            tool_args={},
+            tool_result=tool_result,
+            tool_msg=tool_message,
+        ),
+    )
+
+    _run(BrowserRuntimeRail(_make_bare_runtime()).after_tool_call(ctx))
+
+    assert png not in tool_message.content
+    assert json.loads(tool_message.content)["execution_state"] == "acknowledged"
+    assert "Screenshot of viewport" in tool_message.content
+    assert ctx.inputs.tool_result["multimodal"] == [image]
+    assert tool_result.data["multimodal"] == [image]
 
 
 def test_navigation_invalidates_snapshot_refs_from_older_generation() -> None:

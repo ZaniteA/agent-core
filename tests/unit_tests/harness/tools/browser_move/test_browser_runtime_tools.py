@@ -10,14 +10,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 from openjiuwen.core.foundation.llm import ToolMessage
 from openjiuwen.core.foundation.tool import McpServerConfig, McpToolCard, Tool, ToolCard
 from openjiuwen.core.foundation.tool.mcp.base import MCPTool, McpToolResult
+from openjiuwen.core.single_agent.agents.react_agent import ReActAgent
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, ToolCallInputs
 from openjiuwen.harness.tools.browser_move.clients.stdio_client import BrowserMoveStdioClient
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import BrowserRunGuardrails
+from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+    BrowserRunGuardrails,
+    build_playwright_mcp_config,
+)
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime, BrowserRuntimeRail
 from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime_tools import (
     BrowserBatchInteractTool,
@@ -409,6 +413,48 @@ def test_single_batch_wait_preserves_mcp_outcome_through_browser_client_and_rail
     runtime.resolve_playwright_tool.assert_awaited_once_with("browser_wait_for")
     assert client._session.call_tool.await_count == 2
     client._session.call_tool.assert_awaited_with("browser_wait_for", arguments={"text": "New results"})
+
+
+def test_screenshot_reaches_agent_as_image_through_browser_client_and_rail() -> None:
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    runtime = _make_runtime()
+    client = BrowserMoveStdioClient(build_playwright_mcp_config())
+    client._session = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=CallToolResult(
+                content=[
+                    TextContent(type="text", text="### Result\n- [Screenshot of viewport](page.png)"),
+                    ImageContent(type="image", data=png, mimeType="image/png"),
+                ]
+            )
+        )
+    )
+    native_tool = MCPTool(
+        client,
+        McpToolCard(name="browser_take_screenshot", server_name="playwright-official", description="Screenshot"),
+    )
+    rail = BrowserRuntimeRail(runtime)
+    rail._status_logger = None
+
+    async def exercise():
+        native_result = await native_tool.invoke({})
+        inputs = ToolCallInputs(
+            tool_name="mcp_playwright-official_browser_take_screenshot",
+            tool_args={},
+            tool_result=native_result,
+            tool_msg=ToolMessage(tool_call_id="shot", content=native_tool.render_for_llm(native_result)),
+        )
+        await rail.after_tool_call(AgentCallbackContext(agent=None, inputs=inputs))
+        return inputs
+
+    inputs = _run(exercise())
+
+    message = ReActAgent._build_multimodal_tool_results_message([inputs.tool_result])
+    assert message is not None
+    assert message.content[-1] == {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{png}"}}
+    assert "Screenshot of viewport" in inputs.tool_msg.content
+    assert png not in inputs.tool_msg.content
+    assert "[binary content" not in inputs.tool_msg.content
 
 
 def test_batch_interact_schema_supports_single_action_and_exposes_condition_waits() -> None:

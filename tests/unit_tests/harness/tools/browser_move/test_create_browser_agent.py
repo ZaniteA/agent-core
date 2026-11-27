@@ -14,6 +14,7 @@ from openjiuwen.core.foundation.llm.model import Model
 from openjiuwen.core.foundation.llm.schema.config import ModelRequestConfig
 from openjiuwen.core.foundation.tool import McpServerConfig
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
+from openjiuwen.harness.rails.multimodal_context_summarizer_rail import MultimodalContextSummarizerRail
 from openjiuwen.harness.schema.config import SubAgentConfig
 from openjiuwen.harness.subagents.browser_agent import (
     BROWSER_AGENT_FACTORY_NAME,
@@ -391,6 +392,27 @@ def test_caller_context_processor_rail_is_augmented_with_browser_state() -> None
     processor_map = dict(caller_rail._user_processors)
     assert processor_map["ToolResultWindowProcessor"].keep_last_k == 2
     assert "browser_find" in processor_map["ToolResultWindowProcessor"].tool_names
+
+
+def test_default_wiring_keeps_only_recent_screenshots_in_context() -> None:
+    calls, fake = _capture_create_deep_agent()
+    with _patch_all(fake)[0]:
+        create_browser_agent(_fake_model(), settings=_fake_settings())
+
+    rails = calls[0].get("rails", [])
+    summarizers = [rail for rail in rails if isinstance(rail, MultimodalContextSummarizerRail)]
+    assert len(summarizers) == 1
+    assert summarizers[0]._screenshots_to_keep == 3
+
+
+def test_caller_multimodal_context_summarizer_rail_is_not_duplicated() -> None:
+    calls, fake = _capture_create_deep_agent()
+    caller_rail = MultimodalContextSummarizerRail(screenshots_to_keep=1)
+    with _patch_all(fake)[0]:
+        create_browser_agent(_fake_model(), settings=_fake_settings(), rails=[caller_rail])
+
+    rails = calls[0].get("rails", [])
+    assert [rail for rail in rails if isinstance(rail, MultimodalContextSummarizerRail)] == [caller_rail]
 
 
 def test_default_wiring_does_not_add_sys_operation_rail() -> None:

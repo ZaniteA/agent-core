@@ -98,6 +98,15 @@ def test_non_tool_output_result_renders_as_str() -> None:
 
 
 @pytest.mark.level1
+def test_plain_dict_with_images_renders_without_image_data() -> None:
+    image = {"type": "image", "data_url": "data:image/png;base64,abc"}
+
+    assert _PlainTool().render_for_llm({"content": "shot", "multimodal": [image]}) == "shot"
+    assert _PlainTool().render_for_llm({"path": "a.png", "multimodal": [image]}) == '{"path": "a.png"}'
+    assert _PlainTool().render_for_llm({"content": None, "multimodal": [image]}) == EMPTY_SUCCESS_TEXT
+
+
+@pytest.mark.level1
 def test_mcp_tool_renders_wrapped_result_value() -> None:
     tool = MCPTool(MagicMock(), McpToolCard(id="srv.echo", name="echo", server_name="srv"))
 
