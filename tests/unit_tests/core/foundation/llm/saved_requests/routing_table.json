@@ -1,0 +1,47 @@
+{
+  "anthropic_provider": {
+    "client": "AnthropicModelClient"
+  },
+  "anthropic_provider_responses_mode": {
+    "client": "AnthropicModelClient"
+  },
+  "deepseek_provider": {
+    "client": "OpenAIModelClient",
+    "first_request": "POST https://api.deepseek.com/chat/completions"
+  },
+  "intelli_router": {
+    "client": "IntelliRouterModelClient"
+  },
+  "openai_account_provider": {
+    "client": "OpenAIAccountModelClient",
+    "first_request": "POST https://chatgpt.com/backend-api/codex/responses"
+  },
+  "openai_chat_completions_mode": {
+    "client": "OpenAIModelClient",
+    "first_request": "POST https://api.example.test/v1/chat/completions"
+  },
+  "openai_default": {
+    "client": "OpenAIModelClient",
+    "first_request": "POST https://api.example.test/v1/chat/completions"
+  },
+  "openai_full_chat_address": {
+    "client": "OpenAIModelClient",
+    "first_request": "POST https://api.example.test/v1/chat/completions"
+  },
+  "openai_responses_mode": {
+    "client": "OpenAIModelClient",
+    "first_request": "POST https://api.example.test/v1/responses"
+  },
+  "openai_responses_mode_full_chat_address": {
+    "client": "OpenAIModelClient",
+    "first_request": "POST https://api.example.test/v1/chat/completions/responses"
+  },
+  "openai_with_account_login": {
+    "client": "OpenAIAccountModelClient",
+    "first_request": "POST https://chatgpt.com/backend-api/codex/responses"
+  },
+  "openrouter_responses_mode": {
+    "client": "OpenAIModelClient",
+    "first_request": "POST https://openrouter.ai/api/v1/responses"
+  }
+}

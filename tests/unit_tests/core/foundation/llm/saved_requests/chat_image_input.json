@@ -1,0 +1,32 @@
+[
+  {
+    "body": {
+      "messages": [
+        {
+          "content": [
+            {
+              "text": "What is in this picture?",
+              "type": "text"
+            },
+            {
+              "image_url": {
+                "url": "data:image/png;base64,iVBORw0KGgo="
+              },
+              "type": "image_url"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "model": "gpt-test",
+      "stream": false
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "https://api.example.test/v1/chat/completions"
+  }
+]

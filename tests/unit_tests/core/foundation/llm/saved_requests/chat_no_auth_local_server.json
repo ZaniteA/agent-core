@@ -1,0 +1,20 @@
+[
+  {
+    "body": {
+      "messages": [
+        {
+          "content": "Hello",
+          "role": "user"
+        }
+      ],
+      "model": "qwen3-8b",
+      "stream": false
+    },
+    "headers": {
+      "accept": "application/json",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "http://localhost:8000/v1/chat/completions"
+  }
+]

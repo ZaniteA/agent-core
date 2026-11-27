@@ -1,0 +1,42 @@
+[
+  {
+    "body": {
+      "messages": [
+        {
+          "content": "What is the weather in Paris?",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-test",
+      "stream": false,
+      "tool_choice": "auto",
+      "tools": [
+        {
+          "function": {
+            "description": "Look up the weather in a city.",
+            "name": "get_weather",
+            "parameters": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "https://api.example.test/v1/chat/completions"
+  }
+]

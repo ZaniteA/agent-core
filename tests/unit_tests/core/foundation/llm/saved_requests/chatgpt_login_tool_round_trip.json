@@ -1,0 +1,67 @@
+[
+  {
+    "body": {
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "input": [
+        {
+          "content": [
+            {
+              "text": "What is the weather in Paris?",
+              "type": "input_text"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "arguments": "{\"city\": \"Paris\"}",
+          "call_id": "call_1",
+          "id": "call_1",
+          "name": "get_weather",
+          "type": "function_call"
+        },
+        {
+          "call_id": "call_1",
+          "output": "Sunny, 21 C.",
+          "type": "function_call_output"
+        }
+      ],
+      "instructions": "",
+      "model": "gpt-test",
+      "parallel_tool_calls": true,
+      "reasoning": {
+        "effort": "medium",
+        "summary": "auto"
+      },
+      "store": false,
+      "stream": true,
+      "tool_choice": "auto",
+      "tools": [
+        {
+          "description": "Look up the weather in a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "https://chatgpt.com/backend-api/codex/responses"
+  }
+]

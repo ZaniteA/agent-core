@@ -1,0 +1,24 @@
+[
+  {
+    "body": {
+      "max_tokens": 256,
+      "messages": [
+        {
+          "content": "Hello",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-test",
+      "stop": "END",
+      "stream": false,
+      "temperature": 0.3
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "https://api.openai.com/v1/chat/completions"
+  }
+]

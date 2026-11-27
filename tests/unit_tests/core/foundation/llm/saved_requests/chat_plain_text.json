@@ -1,0 +1,22 @@
+[
+  {
+    "body": {
+      "messages": [
+        {
+          "content": "Hello",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-test",
+      "stream": false
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json",
+      "x-team": "search"
+    },
+    "method": "POST",
+    "url": "https://api.example.test/v1/chat/completions"
+  }
+]

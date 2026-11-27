@@ -1,0 +1,26 @@
+[
+  {
+    "body": {
+      "agent_hint": {
+        "parent_session_id": "session-1",
+        "session_id": "session-1"
+      },
+      "messages": [
+        {
+          "content": "Hello",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-test",
+      "stream": false
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json",
+      "x-gateway-token": "gateway"
+    },
+    "method": "POST",
+    "url": "https://api.example.test/v1/chat/completions"
+  }
+]

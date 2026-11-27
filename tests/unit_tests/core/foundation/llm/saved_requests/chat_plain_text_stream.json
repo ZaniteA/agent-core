@@ -1,0 +1,28 @@
+[
+  {
+    "body": {
+      "messages": [
+        {
+          "content": "You are brief.",
+          "role": "system"
+        },
+        {
+          "content": "Hello",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-test",
+      "stream": true,
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "https://api.example.test/v1/chat/completions"
+  }
+]
