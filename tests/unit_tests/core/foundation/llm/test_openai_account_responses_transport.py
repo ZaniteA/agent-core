@@ -351,6 +351,42 @@ async def test_create_response_posts_to_openai_account_backend():
     assert message.usage_metadata.total_tokens == 3
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        DEFAULT_OPENAI_ACCOUNT_BASE_URL,
+        f"{DEFAULT_OPENAI_ACCOUNT_BASE_URL}/",
+        f"{DEFAULT_OPENAI_ACCOUNT_BASE_URL}/responses",
+        f"{DEFAULT_OPENAI_ACCOUNT_BASE_URL}/chat/completions",
+    ],
+)
+@pytest.mark.asyncio
+async def test_create_response_adds_responses_path_once_and_keeps_session_headers(base_url):
+    """The ChatGPT-login backend gets one /responses path and still gets the session headers."""
+    seen_requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(
+            200,
+            content=(
+                "event: response.completed\n"
+                'data: {"response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    transport = OpenAIAccountResponsesTransport(base_url=base_url, transport=httpx.MockTransport(handler))
+    body = build_request_body(model="gpt-5.4-mini", messages="hello")
+
+    await transport.create_response(body=body, access_token="access-token", session_id="session-1")
+
+    assert [str(request.url) for request in seen_requests] == [f"{DEFAULT_OPENAI_ACCOUNT_BASE_URL}/responses"]
+    assert seen_requests[0].headers["Authorization"] == "Bearer access-token"
+    assert seen_requests[0].headers["session_id"] == "session-1"
+    assert seen_requests[0].headers["x-client-request-id"] == "session-1"
+
+
 @pytest.mark.asyncio
 async def test_create_response_preserves_tool_call_finish_reason_from_stream():
     async def handler(request: httpx.Request) -> httpx.Response:
