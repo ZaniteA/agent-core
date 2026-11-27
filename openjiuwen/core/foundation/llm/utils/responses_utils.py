@@ -159,16 +159,21 @@ def _text_format_from_response_format(response_format: Any) -> Optional[dict[str
 
 def build_headers(
     *,
-    access_token: str,
+    access_token: Optional[str],
     session_id: Optional[str] = None,
     extra_headers: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
-    """Create HTTP headers for an account-backed Responses request."""
-    if not access_token:
+    """Create HTTP headers for a Responses request.
+
+    ``access_token=None`` means the server needs no key: no ``Authorization`` header is
+    sent, as in Chat Completions mode. An empty token is still an error.
+    """
+    if access_token is not None and not access_token:
         raise OpenAIAccountResponsesError("OpenAI account Responses request requires an access token.")
 
     headers = sanitize_headers(extra_headers)
-    headers["Authorization"] = f"Bearer {access_token}"
+    if access_token is not None:
+        headers["Authorization"] = f"Bearer {access_token}"
     headers["Accept"] = "application/json"
     headers["Content-Type"] = "application/json"
     if session_id:
@@ -184,6 +189,11 @@ def convert_messages(messages: Union[str, list[BaseMessage], list[dict]]) -> tup
     fallback_tool_call_index = 0
 
     for message in _message_dicts(messages):
+        if _is_response_item(message):
+            # Already a Responses item (reasoning, function_call, item_reference, ...): send it as is.
+            inputs.append(message)
+            continue
+
         role = str(message.get("role") or "user")
         content_text = _content_as_text(message.get("content"))
 
@@ -517,6 +527,12 @@ def _message_dicts(messages: Union[str, list[BaseMessage], list[dict]]) -> list[
     return converted
 
 
+def _is_response_item(message: dict[str, Any]) -> bool:
+    """Whether a message dict is a ready-made Responses input item: it has a ``type`` and no ``role``."""
+    item_type = message.get("type")
+    return not message.get("role") and isinstance(item_type, str) and bool(item_type)
+
+
 def _content_as_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -547,9 +563,10 @@ def _content_part_text(part: Any) -> str:
 
 
 def _user_content_parts(content: Any, content_text: str) -> list[dict[str, Any]]:
-    """Map user content to Responses ``input_text`` and ``input_image`` parts in their original order.
+    """Map user content to Responses parts in their original order.
     Adjacent text parts are merged into one ``input_text``.
-    Parts that are neither text nor images are dropped.
+    Image and file parts are kept (see :func:`_input_media_part`).
+    Other parts (audio, video) are dropped.
     """
     if not isinstance(content, list):
         return [{"type": "input_text", "text": content_text}]
@@ -563,10 +580,10 @@ def _user_content_parts(content: Any, content_text: str) -> list[dict[str, Any]]
             pending_text.clear()
 
     for part in content:
-        image = _input_image_part(part)
-        if image is not None:
+        media = _input_media_part(part)
+        if media is not None:
             flush_text()
-            parts.append(image)
+            parts.append(media)
             continue
         text = _content_part_text(part)
         if text:
@@ -574,6 +591,40 @@ def _user_content_parts(content: Any, content_text: str) -> list[dict[str, Any]]
     flush_text()
 
     return parts or [{"type": "input_text", "text": ""}]
+
+
+def _input_media_part(part: Any) -> Optional[dict[str, Any]]:
+    """Map an image or file part to its Responses form; None for any other part.
+
+    ``input_image`` and ``input_file`` parts are already in Responses form and are copied unchanged.
+    Chat-style ``image_url`` parts and agent-core's own ``image`` parts become ``input_image``.
+    """
+    if not isinstance(part, dict):
+        return None
+    part_type = part.get("type")
+    if part_type in {"input_image", "input_file"}:
+        return dict(part)
+    if part_type == "image":
+        return _agent_image_part(part)
+    return _input_image_part(part)
+
+
+def _agent_image_part(part: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Convert agent-core's ``{"type": "image", ...}`` part to a Responses ``input_image`` part.
+
+    The image is ``data_url``, or a ``source`` dict of type ``base64`` (``media_type`` and ``data``)
+    or ``url``. Without a usable image the part is dropped.
+    """
+    image_url = part.get("data_url")
+    source = part.get("source")
+    if not image_url and isinstance(source, dict):
+        if source.get("type") == "base64" and source.get("media_type") and source.get("data"):
+            image_url = f"data:{source['media_type']};base64,{source['data']}"
+        elif source.get("type") == "url":
+            image_url = source.get("url")
+    if not isinstance(image_url, str) or not image_url:
+        return None
+    return {"type": "input_image", "image_url": image_url}
 
 
 def _input_image_part(part: Any) -> Optional[dict[str, Any]]:

@@ -66,12 +66,15 @@ class OpenAIAccountResponsesTransport:
         self,
         *,
         body: dict[str, Any],
-        access_token: str,
+        access_token: Optional[str],
         model_name: Optional[str] = None,
         session_id: Optional[str] = None,
         extra_headers: Optional[dict[str, str]] = None,
     ) -> AssistantMessage:
-        """Send a request and accumulate the streamed chunks into a single message."""
+        """Send a request and accumulate the streamed chunks into a single message.
+
+        ``access_token=None`` sends no ``Authorization`` header (see :func:`build_headers`).
+        """
         final_chunk: Optional[AssistantMessageChunk] = None
         async for chunk in self.stream_response(
             body=body,
@@ -87,12 +90,15 @@ class OpenAIAccountResponsesTransport:
         self,
         *,
         body: dict[str, Any],
-        access_token: str,
+        access_token: Optional[str],
         model_name: Optional[str] = None,
         session_id: Optional[str] = None,
         extra_headers: Optional[dict[str, str]] = None,
     ) -> AsyncIterator[AssistantMessageChunk]:
-        """Stream response chunks from the Responses API."""
+        """Stream response chunks from the Responses API.
+
+        ``access_token=None`` sends no ``Authorization`` header (see :func:`build_headers`).
+        """
         stream_body = dict(body)
         stream_body["stream"] = True
         effective_model = model_name or str(body.get("model") or "")
@@ -145,7 +151,14 @@ class OpenAIAccountResponsesTransport:
             self._client = None
 
     def _responses_url(self) -> str:
-        return f"{self.base_url}/responses"
+        # Clean the base the way Chat mode does (strip a trailing /chat/completions),
+        # and never add /responses twice.
+        base = self.base_url
+        if base.endswith("/responses"):
+            return base
+        if base.endswith("/chat/completions"):
+            base = base[: -len("/chat/completions")].rstrip("/")
+        return f"{base}/responses"
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:

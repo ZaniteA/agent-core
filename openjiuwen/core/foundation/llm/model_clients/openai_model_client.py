@@ -17,6 +17,7 @@ from typing import (
     Tuple,
     Union,
 )
+from urllib.parse import urlparse
 
 import httpx
 from openjiuwen.core.common.exception.codes import StatusCode
@@ -1378,6 +1379,17 @@ class OpenAIModelClient(BaseModelClient):
             request_fallback=self._responses_request_fallback,
         )
 
+    def _responses_access_token(self) -> Optional[str]:
+        """Bearer token for Responses requests; None sends no ``Authorization`` header, as Chat mode does."""
+        if _should_omit_authorization(self.model_client_config):
+            return None
+        return self.model_client_config.api_key
+
+    def _sends_responses_session_headers(self) -> bool:
+        """Whether ``session_id`` / ``x-client-request-id`` headers go out: only to api.openai.com."""
+        host = urlparse(str(self.model_client_config.api_base or "").strip()).hostname
+        return host == "api.openai.com"
+
     async def _parse_responses_content(self, content: str, output_parser: BaseOutputParser) -> Any:
         try:
             return await output_parser.parse(content)
@@ -1448,9 +1460,9 @@ class OpenAIModelClient(BaseModelClient):
         try:
             response = await self._make_responses_transport(timeout=timeout).create_response(
                 body=body,
-                access_token=self._resolved_api_key(),
+                access_token=self._responses_access_token(),
                 model_name=str(body.get("model") or ""),
-                session_id=session_id,
+                session_id=session_id if self._sends_responses_session_headers() else None,
                 extra_headers=request_headers,
             )
         except Exception as exc:
@@ -1543,9 +1555,9 @@ class OpenAIModelClient(BaseModelClient):
         try:
             async for chunk in self._make_responses_transport(timeout=timeout).stream_response(
                 body=body,
-                access_token=self._resolved_api_key(),
+                access_token=self._responses_access_token(),
                 model_name=str(body.get("model") or ""),
-                session_id=session_id,
+                session_id=session_id if self._sends_responses_session_headers() else None,
                 extra_headers=request_headers,
             ):
                 await trigger(
