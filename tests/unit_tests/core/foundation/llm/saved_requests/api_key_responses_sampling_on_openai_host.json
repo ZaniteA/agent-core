@@ -1,0 +1,31 @@
+[
+  {
+    "body": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "Hello",
+              "type": "input_text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "instructions": "",
+      "max_output_tokens": 256,
+      "model": "gpt-test",
+      "stop": "END",
+      "store": false,
+      "stream": true,
+      "temperature": 0.3
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "https://api.openai.com/v1/responses"
+  }
+]

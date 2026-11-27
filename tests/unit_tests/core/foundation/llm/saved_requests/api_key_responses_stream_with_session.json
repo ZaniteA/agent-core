@@ -1,0 +1,30 @@
+[
+  {
+    "body": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "Hello",
+              "type": "input_text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "instructions": "You are brief.",
+      "model": "gpt-test",
+      "store": false,
+      "stream": true
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json",
+      "session_id": "session-1",
+      "x-client-request-id": "session-1"
+    },
+    "method": "POST",
+    "url": "https://api.example.test/v1/responses"
+  }
+]

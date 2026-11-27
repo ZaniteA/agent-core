@@ -16,6 +16,9 @@
     "client": "OpenAIAccountModelClient",
     "first_request": "POST https://chatgpt.com/backend-api/codex/responses"
   },
+  "openai_anthropic_messages_mode": {
+    "client": "AnthropicModelClient"
+  },
   "openai_chat_completions_mode": {
     "client": "OpenAIModelClient",
     "first_request": "POST https://api.example.test/v1/chat/completions"

@@ -1,0 +1,29 @@
+[
+  {
+    "body": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "Hello",
+              "type": "input_text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "instructions": "",
+      "model": "gpt-test",
+      "store": false,
+      "stream": true
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json",
+      "x-team": "search"
+    },
+    "method": "POST",
+    "url": "https://api.example.test/v1/responses"
+  }
+]

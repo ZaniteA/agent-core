@@ -1,0 +1,28 @@
+[
+  {
+    "body": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "Hello",
+              "type": "input_text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "instructions": "",
+      "model": "qwen3-8b",
+      "store": false,
+      "stream": true
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "http://localhost:8000/v1/responses"
+  }
+]

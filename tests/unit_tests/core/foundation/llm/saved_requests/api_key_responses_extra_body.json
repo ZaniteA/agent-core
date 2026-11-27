@@ -1,0 +1,33 @@
+[
+  {
+    "body": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "Hello",
+              "type": "input_text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "instructions": "",
+      "model": "gpt-test",
+      "provider_option": {
+        "region": "eu"
+      },
+      "seed": 7,
+      "store": false,
+      "stream": true,
+      "top_k": 20
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "https://api.example.test/v1/responses"
+  }
+]

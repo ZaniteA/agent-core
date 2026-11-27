@@ -1,0 +1,32 @@
+[
+  {
+    "body": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "What is in this picture?",
+              "type": "input_text"
+            },
+            {
+              "image_url": "data:image/png;base64,iVBORw0KGgo=",
+              "type": "input_image"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "instructions": "",
+      "model": "gpt-test",
+      "store": false,
+      "stream": true
+    },
+    "headers": {
+      "accept": "application/json",
+      "authorization": "<redacted>",
+      "content-type": "application/json"
+    },
+    "method": "POST",
+    "url": "https://api.example.test/v1/responses"
+  }
+]
