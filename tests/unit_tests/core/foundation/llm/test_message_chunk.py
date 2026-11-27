@@ -246,6 +246,52 @@ def test_assistant_add_merges_tool_calls_without_id():
     assert result.tool_calls[0].index == 0
 
 
+def test_assistant_add_merges_interleaved_tool_calls_by_item_id():
+    """Responses fragments join the call with the same item id, even when it is not the last call."""
+    def fragment(call_id, name, arguments, item_id):
+        return AssistantMessageChunk(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id=call_id, type="function", name=name, arguments=arguments,
+                                 index=0, response_item_id=item_id)],
+        )
+
+    result = (
+        fragment("call_1", "read", "", "fc_1")
+        + fragment("call_2", "write", "", "fc_2")
+        + fragment("call_1", "", '{"p":', "fc_1")
+        + fragment("call_2", "", '{"q":2}', "fc_2")
+        + fragment("call_1", "", "1}", "fc_1")
+    )
+
+    assert [(tc.id, tc.name, tc.arguments, tc.index) for tc in result.tool_calls] == [
+        ("call_1", "read", '{"p":1}', 0),
+        ("call_2", "write", '{"q":2}', 1),
+    ]
+    assert [tc.response_item_id for tc in result.tool_calls] == ["fc_1", "fc_2"]
+
+
+def test_assistant_add_keeps_last_call_rule_for_chat_fragments():
+    """Chat fragments have no item id, so a fragment without a call id still joins the last call."""
+    chunk1 = AssistantMessageChunk(
+        role="assistant",
+        content="",
+        tool_calls=[
+            ToolCall(id="call_1", type="function", name="read", arguments="{}", index=0),
+            ToolCall(id="call_2", type="function", name="write", arguments="{", index=1),
+        ],
+    )
+    chunk2 = AssistantMessageChunk(
+        role="assistant",
+        content="",
+        tool_calls=[ToolCall(id=None, type="function", name="", arguments="}", index=1)],
+    )
+
+    result = chunk1 + chunk2
+
+    assert [(tc.id, tc.arguments) for tc in result.tool_calls] == [("call_1", "{}"), ("call_2", "{}")]
+
+
 def test_assistant_add_copies_tool_call_with_index():
     """Test that __add__ copies tool calls preserving index field."""
     tc = ToolCall(id="call_1", type="function", name="func", arguments="{}", index=5)

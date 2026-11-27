@@ -3,17 +3,22 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import BaseError, build_error
 from openjiuwen.core.foundation.llm import (
     AssistantMessageChunk,
+    LLMApiMode,
+    Model,
     ModelClientConfig,
     ModelRequestConfig,
 )
+from openjiuwen.core.foundation.llm.utils.responses_transport import OpenAIAccountResponsesTransport
 from openjiuwen.core.single_agent import AgentCard, ReActAgent, ReActAgentConfig
 from openjiuwen.core.single_agent.rail.base import (
     MODEL_VISIBLE_OUTPUT_EMITTED_KEY,
@@ -464,3 +469,97 @@ async def test_rail_does_not_retry_rate_limit_after_visible_output():
         await agent.invoke({"query": "rate limit after text"}, _streaming=True)
 
     assert model.call_count == 1
+
+
+# Responses streams that break raise ResponsesStreamInterruptedError. Until the agent gets its own
+# broken-stream rule, this rail treats it like other transient failures: retried before visible
+# output (tool-call arguments are not visible output), not retried after text was shown.
+_RESPONSES_TEXT = 'event: response.output_text.delta\ndata: {"delta": "%s"}\n\n'
+_RESPONSES_COMPLETED = 'event: response.completed\ndata: {"response": {"status": "completed"}}\n\n'
+_RESPONSES_TOOL_ARGUMENTS = (
+    'event: response.output_item.added\n'
+    'data: {"item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "write", "arguments": ""}}\n\n'
+    'event: response.function_call_arguments.delta\ndata: {"item_id": "fc_1", "delta": "{\\"path\\":"}\n\n'
+)
+
+
+class _DroppedBody(httpx.AsyncByteStream):
+    def __init__(self, body: str):
+        self._body = body.encode()
+
+    async def __aiter__(self):
+        yield self._body
+        raise httpx.ReadError("connection reset by peer")
+
+
+def _responses_model(monkeypatch, first_body: str, *, drop: bool) -> tuple[Model, list]:
+    """A Responses-mode model whose first reply is ``first_body``; later replies answer "recovered"."""
+    requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        headers = {"content-type": "text/event-stream"}
+        if len(requests) == 1 and drop:
+            return httpx.Response(200, stream=_DroppedBody(first_body), headers=headers)
+        body = first_body if len(requests) == 1 else _RESPONSES_TEXT % "recovered" + _RESPONSES_COMPLETED
+        return httpx.Response(200, content=body.encode(), headers=headers)
+
+    monkeypatch.setattr(
+        OpenAIAccountResponsesTransport,
+        "_make_client",
+        lambda _: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    model = Model(
+        model_client_config=ModelClientConfig(
+            client_provider="OpenAI",
+            api_mode=LLMApiMode.Responses,
+            api_key="sk-test",
+            api_base="https://mock.local/v1",
+            verify_ssl=False,
+        ),
+        model_config=ModelRequestConfig(model="mock-model"),
+    )
+    return model, requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_body", "drop"),
+    [("", True), (_RESPONSES_TOOL_ARGUMENTS, True), (_RESPONSES_TOOL_ARGUMENTS, False)],
+    ids=["dropped_before_output", "dropped_in_tool_arguments", "no_closing_event_in_tool_arguments"],
+)
+async def test_rail_retries_broken_responses_stream_before_visible_output(monkeypatch, first_body, drop):
+    agent = _make_agent()
+    await agent.register_rail(ModelAnomalyDetectionRail(transient_base_delay_seconds=0.0))
+    model, requests = _responses_model(monkeypatch, first_body, drop=drop)
+    agent.set_llm(model)
+
+    result = await agent.invoke({"query": "broken stream"}, _streaming=True)
+
+    assert result["output"] == "recovered"
+    assert len(requests) == 2
+    # The half-written tool call was neither run nor kept in the conversation.
+    retried_input = json.loads(requests[1].content)["input"]
+    assert [item for item in retried_input if item.get("type") == "function_call"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_body", "drop"),
+    [
+        (_RESPONSES_TEXT % "partial", True),
+        (_RESPONSES_TEXT % "partial", False),
+        ('event: response.cancelled\ndata: {"response": {"status": "cancelled"}}\n\n', False),
+    ],
+    ids=["dropped_after_text", "no_closing_event_after_text", "cancelled"],
+)
+async def test_rail_does_not_retry_broken_responses_stream_after_text_or_cancel(monkeypatch, first_body, drop):
+    agent = _make_agent()
+    await agent.register_rail(ModelAnomalyDetectionRail(transient_base_delay_seconds=0.0))
+    model, requests = _responses_model(monkeypatch, first_body, drop=drop)
+    agent.set_llm(model)
+
+    with pytest.raises(BaseError):
+        await agent.invoke({"query": "broken stream"}, _streaming=True)
+
+    assert len(requests) == 1
