@@ -37,7 +37,7 @@
   },
   "openai_responses_mode_full_chat_address": {
     "client": "OpenAIModelClient",
-    "first_request": "POST https://api.example.test/v1/chat/completions/responses"
+    "first_request": "POST https://api.example.test/v1/responses"
   },
   "openai_with_account_login": {
     "client": "OpenAIAccountModelClient",

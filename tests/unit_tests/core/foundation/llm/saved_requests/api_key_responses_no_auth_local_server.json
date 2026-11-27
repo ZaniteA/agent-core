@@ -19,7 +19,6 @@
     },
     "headers": {
       "accept": "application/json",
-      "authorization": "Bearer EMPTY",
       "content-type": "application/json"
     },
     "method": "POST",
