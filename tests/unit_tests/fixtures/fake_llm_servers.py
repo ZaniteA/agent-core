@@ -8,10 +8,18 @@ retry rules, stream reading) with no network. It answers in the format the
 request address asks for:
 
 - ``.../chat/completions``: OpenAI Chat Completions, as one JSON reply or as
-  SSE chunks ending with ``data: [DONE]``.
-- ``.../responses``: OpenAI Responses SSE events ending with
-  ``response.completed``. The ChatGPT-login backend uses the same format.
+  SSE chunks ending with ``data: [DONE]``. A streamed tool call sends its id
+  and name first, then its arguments in pieces, as real servers do.
+- ``.../responses``: OpenAI Responses SSE events in the documented order:
+  ``response.created`` and ``response.in_progress``; for each output item,
+  ``output_item.added``, its part, delta and ``done`` events, and
+  ``output_item.done``; then ``response.completed``. The ChatGPT-login
+  backend uses the same format.
 - any other address: HTTP 404. The request is still recorded.
+
+The streams stay small: each text or reasoning part arrives in one delta, and
+there are no keep-alive comments, unknown events, ``response.failed`` or
+``response.incomplete`` events. Add them here when a test needs them.
 
 Script the replies in order, then read ``server.requests``::
 
@@ -42,13 +50,16 @@ from openjiuwen.core.foundation.llm.model_clients.openai_model_client import Ope
 
 REDACTED = "<redacted>"
 
-# Header values that are secrets. A saved copy keeps the header name, so its
-# presence still shows, but never the value.
-_SECRET_HEADERS = frozenset({"authorization", "proxy-authorization", "api-key", "x-api-key", "cookie"})
+# A header whose name contains one of these words holds a secret. A saved copy
+# keeps the header name, so its presence still shows, but never the value.
+_SECRET_HEADER_WORDS = ("auth", "cookie", "key", "secret", "token")
 # Headers that httpx or the OpenAI SDK set for themselves. They change with the
 # library version or the machine, not with anything agent-core decides.
 _LIBRARY_HEADERS = frozenset({"accept-encoding", "connection", "content-length", "host", "user-agent"})
 _LIBRARY_HEADER_PREFIXES = ("x-stainless-",)
+# Environment variables the OpenAI SDK reads into every request; for example
+# ``OPENAI_ORG_ID`` becomes an ``OpenAI-Organization`` header.
+_OPENAI_SDK_ENVIRONMENT = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID")
 
 _CHAT_USAGE = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
 _RESPONSES_USAGE = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
@@ -78,7 +89,7 @@ class RecordedRequest:
         for name, value in sorted(self.headers.items()):
             if name in _LIBRARY_HEADERS or name.startswith(_LIBRARY_HEADER_PREFIXES):
                 continue
-            headers[name] = REDACTED if name in _SECRET_HEADERS else value
+            headers[name] = REDACTED if any(word in name for word in _SECRET_HEADER_WORDS) else value
         return {"method": self.method, "url": self.url, "headers": headers, "body": self.body}
 
 
@@ -130,9 +141,18 @@ class StreamFault:
 
 
 async def faulty_stream(events: list[bytes], fault: Optional[StreamFault]) -> AsyncIterator[bytes]:
-    """Send ``events`` one at a time, broken the way ``fault`` says."""
+    """Send ``events`` one at a time, broken the way ``fault`` says.
+
+    Raises:
+        ValueError: When ``fault.after`` is outside ``0..len(events)``. Such a
+            fault would never fire, and the test would get a normal answer.
+    """
     if fault is not None and fault.kind == "no_closing_event":
         events = events[:-1]
+    elif fault is not None and not 0 <= fault.after <= len(events):
+        raise ValueError(
+            f"StreamFault.{fault.kind}(after={fault.after}) never fires on a stream of {len(events)} events"
+        )
     for index in range(len(events) + 1):
         if fault is not None and index == fault.after:
             if fault.kind == "cut":
@@ -224,8 +244,12 @@ def install_fake_server(monkeypatch, server: FakeModelServer) -> FakeModelServer
     login. So this one patch catches their requests, while the real address
     building, headers, retry rules and stream reading still run. It is the
     only private patch point: if a client stops opening ``httpx.AsyncClient``,
-    fix it here. Proxies are switched off so no request can leave the machine.
+    fix it here. Proxies are switched off so no request can leave the machine,
+    and the OpenAI SDK's environment variables are cleared so a request does
+    not depend on the machine it runs on.
     """
+    for name in _OPENAI_SDK_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
     transport = server.transport()
     original_init = httpx.AsyncClient.__init__
 
@@ -280,16 +304,10 @@ def _sse(data: Any, *, event: str = "") -> bytes:
     return ("\n".join(lines) + "\n\n").encode()
 
 
-def _chat_tool_calls(reply: _Reply) -> list[dict[str, Any]]:
-    return [
-        {
-            "index": index,
-            "id": call.call_id,
-            "type": "function",
-            "function": {"name": call.name, "arguments": call.arguments_text()},
-        }
-        for index, call in enumerate(reply.tool_calls)
-    ]
+def _argument_pieces(arguments: str) -> list[str]:
+    """Split tool-call arguments in two, as servers stream them in pieces."""
+    middle = len(arguments) // 2
+    return [piece for piece in (arguments[:middle], arguments[middle:]) if piece]
 
 
 def _chat_completion(reply: _Reply, model: str, number: int) -> dict[str, Any]:
@@ -298,7 +316,12 @@ def _chat_completion(reply: _Reply, model: str, number: int) -> dict[str, Any]:
         message["reasoning_content"] = reply.reasoning
     if reply.tool_calls:
         message["tool_calls"] = [
-            {key: value for key, value in call.items() if key != "index"} for call in _chat_tool_calls(reply)
+            {
+                "id": call.call_id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments_text()},
+            }
+            for call in reply.tool_calls
         ]
     return {
         "id": f"chatcmpl-fake-{number}",
@@ -325,8 +348,12 @@ def _chat_chunks(reply: _Reply, model: str, number: int, *, include_usage: bool)
         chunks.append(chunk({"reasoning_content": reply.reasoning}))
     if reply.text:
         chunks.append(chunk({"content": reply.text}))
-    for tool_call in _chat_tool_calls(reply):
-        chunks.append(chunk({"tool_calls": [tool_call]}))
+    for index, call in enumerate(reply.tool_calls):
+        opening = {"index": index, "id": call.call_id, "type": "function",
+                   "function": {"name": call.name, "arguments": ""}}
+        chunks.append(chunk({"tool_calls": [opening]}))
+        for piece in _argument_pieces(call.arguments_text()):
+            chunks.append(chunk({"tool_calls": [{"index": index, "function": {"arguments": piece}}]}))
     chunks.append(chunk({}, _finish_reason(reply)))
     if include_usage:
         chunks.append({**chunk({}), "choices": [], "usage": _CHAT_USAGE})
@@ -336,40 +363,57 @@ def _chat_chunks(reply: _Reply, model: str, number: int, *, include_usage: bool)
 def _responses_events(reply: _Reply, model: str, number: int) -> list[bytes]:
     response = {"id": f"resp_fake_{number}", "object": "response", "model": model}
     output: list[dict[str, Any]] = []
+    in_progress = {**response, "status": "in_progress", "output": []}
     events: list[dict[str, Any]] = [
-        {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
+        {"type": "response.created", "response": in_progress},
+        {"type": "response.in_progress", "response": in_progress},
     ]
 
-    def add_item(added: dict[str, Any], deltas: list[dict[str, Any]], done: dict[str, Any]) -> None:
+    def add_item(added: dict[str, Any], item_events: list[dict[str, Any]], done: dict[str, Any]) -> None:
         index = len(output)
         events.append({"type": "response.output_item.added", "output_index": index, "item": added})
-        events.extend({"output_index": index, "item_id": added["id"], **delta} for delta in deltas)
+        events.extend({"output_index": index, "item_id": added["id"], **event} for event in item_events)
         events.append({"type": "response.output_item.done", "output_index": index, "item": done})
         output.append(done)
 
     if reply.reasoning:
+        part = {"type": "summary_text", "text": reply.reasoning}
         item = {"id": f"rs_fake_{number}", "type": "reasoning", "summary": []}
         add_item(
             item,
-            [{"type": "response.reasoning_summary_text.delta", "summary_index": 0, "delta": reply.reasoning}],
-            {**item, "summary": [{"type": "summary_text", "text": reply.reasoning}]},
+            [
+                {"type": "response.reasoning_summary_part.added", "summary_index": 0, "part": {**part, "text": ""}},
+                {"type": "response.reasoning_summary_text.delta", "summary_index": 0, "delta": reply.reasoning},
+                {"type": "response.reasoning_summary_text.done", "summary_index": 0, "text": reply.reasoning},
+                {"type": "response.reasoning_summary_part.done", "summary_index": 0, "part": part},
+            ],
+            {**item, "summary": [part]},
         )
     if reply.text:
+        part = {"type": "output_text", "text": reply.text, "annotations": []}
         item = {"id": f"msg_fake_{number}", "type": "message", "role": "assistant", "status": "in_progress",
                 "content": []}
         add_item(
             item,
-            [{"type": "response.output_text.delta", "content_index": 0, "delta": reply.text}],
-            {**item, "status": "completed",
-             "content": [{"type": "output_text", "text": reply.text, "annotations": []}]},
+            [
+                {"type": "response.content_part.added", "content_index": 0, "part": {**part, "text": ""}},
+                {"type": "response.output_text.delta", "content_index": 0, "delta": reply.text},
+                {"type": "response.output_text.done", "content_index": 0, "text": reply.text},
+                {"type": "response.content_part.done", "content_index": 0, "part": part},
+            ],
+            {**item, "status": "completed", "content": [part]},
         )
     for call_number, call in enumerate(reply.tool_calls, start=1):
+        arguments = call.arguments_text()
         item = {"id": f"fc_fake_{number}_{call_number}", "type": "function_call", "status": "in_progress",
                 "call_id": call.call_id, "name": call.name, "arguments": ""}
+        deltas = [
+            {"type": "response.function_call_arguments.delta", "delta": piece} for piece in _argument_pieces(arguments)
+        ]
         add_item(
             item,
-            [{"type": "response.function_call_arguments.delta", "delta": call.arguments_text()}],
-            {**item, "status": "completed", "arguments": call.arguments_text()},
+            deltas + [{"type": "response.function_call_arguments.done", "arguments": arguments}],
+            {**item, "status": "completed", "arguments": arguments},
         )
 
     events.append(

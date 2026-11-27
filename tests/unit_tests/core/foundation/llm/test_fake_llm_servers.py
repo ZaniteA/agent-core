@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -25,14 +26,18 @@ from tests.unit_tests.fixtures.fake_llm_servers import (  # noqa: F401  (fake_mo
     FakeToolCall,
     StreamFault,
     fake_model_server,
+    faulty_stream,
+    install_fake_server,
+    reset_model_client_caches,
 )
 
 _API_BASE = "https://api.example.test/v1"
 _PROTOCOLS = [pytest.param(None, id="chat"), pytest.param("responses", id="responses")]
 # Events sent before the answer text has arrived in full: Chat sends the role
 # chunk, then the text chunk; Responses sends response.created,
-# output_item.added, then the text delta.
-_EVENTS_UP_TO_TEXT = {None: 2, "responses": 3}
+# response.in_progress, output_item.added, content_part.added, then the text
+# delta.
+_EVENTS_UP_TO_TEXT = {None: 2, "responses": 5}
 _WEATHER_CALL = FakeToolCall(name="get_weather", arguments={"city": "Paris"})
 
 
@@ -93,7 +98,7 @@ async def test_tool_call_and_reasoning_reach_the_caller(fake_model_server, api_m
 
 @pytest.mark.asyncio
 async def test_saved_copy_keeps_agent_core_headers_and_hides_secrets(fake_model_server):
-    await _model(custom_headers={"X-Team": "search"}).invoke("hi")
+    await _model(custom_headers={"X-Team": "search", "X-Gateway-Token": "gateway"}).invoke("hi")
 
     saved = fake_model_server.requests[0].saved_copy()
 
@@ -104,10 +109,30 @@ async def test_saved_copy_keeps_agent_core_headers_and_hides_secrets(fake_model_
             "accept": "application/json",
             "authorization": REDACTED,
             "content-type": "application/json",
+            "x-gateway-token": REDACTED,
             "x-team": "search",
         },
         "body": {"messages": [{"role": "user", "content": "hi"}], "model": "gpt-test", "stream": False},
     }
+
+
+@pytest.mark.asyncio
+async def test_openai_sdk_environment_does_not_reach_the_request(monkeypatch):
+    # The OpenAI SDK turns these variables into OpenAI-Organization and
+    # OpenAI-Project headers. Installing the fake server clears them, so a
+    # saved copy is the same on every machine.
+    monkeypatch.setenv("OPENAI_ORG_ID", "org-from-environment")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "proj-from-environment")
+    await reset_model_client_caches()
+    server = install_fake_server(monkeypatch, FakeModelServer())
+
+    try:
+        await _model().invoke("hi")
+    finally:
+        await reset_model_client_caches()
+
+    headers = server.requests[0].saved_copy()["headers"]
+    assert not {"openai-organization", "openai-project"} & set(headers)
 
 
 @pytest.mark.asyncio
@@ -164,14 +189,17 @@ async def test_cut_stream_keeps_the_text_already_sent_and_then_fails(fake_model_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api_mode", _PROTOCOLS)
 async def test_stream_without_closing_event_counts_as_finished_today(fake_model_server, api_mode):
-    # Chat still got its finish chunk; only ``data: [DONE]`` is missing.
-    # Known gap for Responses: no finish reason and no usage, yet no error. A
-    # later change makes this an error that is retried.
+    # Chat still got its finish and usage chunks; only ``data: [DONE]`` is
+    # missing. Known gap for Responses: no finish reason and no usage, yet no
+    # error. A later change makes this an error that is retried.
     fake_model_server.add_reply(text="Hello", fault=StreamFault.no_closing_event())
 
     message = await _call(_model(api_mode), stream=True)
 
-    assert (message.content, message.finish_reason) == ("Hello", "null" if api_mode else "stop")
+    total_tokens = message.usage_metadata.total_tokens if message.usage_metadata else None
+    assert (message.content, message.finish_reason, total_tokens) == (
+        ("Hello", "null", None) if api_mode else ("Hello", "stop", 15)
+    )
 
 
 @pytest.mark.asyncio
@@ -195,3 +223,29 @@ async def test_stall_holds_the_stream_back(fake_model_server, api_mode):
         await asyncio.wait_for(_stream_text(_model(api_mode), received), timeout=0.5)
 
     assert "".join(received) == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_mode", _PROTOCOLS)
+async def test_short_stall_pauses_then_carries_on(fake_model_server, api_mode):
+    fake_model_server.add_reply(text="Hello", fault=StreamFault.stall(after=1, seconds=0.1))
+    started = time.monotonic()
+
+    message = await _call(_model(api_mode), stream=True)
+
+    # Lower bound only, with slack for coarse timers on Windows.
+    assert time.monotonic() - started >= 0.05
+    assert (message.content, message.finish_reason) == ("Hello", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [StreamFault.cut(after=4), StreamFault.garbled_line(after=-1), StreamFault.stall(after=9, seconds=0)],
+    ids=["cut", "garbled_line", "stall"],
+)
+async def test_fault_that_never_fires_is_refused(fault):
+    events = [b"data: 1\n\n", b"data: 2\n\n", b"data: [DONE]\n\n"]
+
+    with pytest.raises(ValueError, match="never fires on a stream of 3 events"):
+        _ = [event async for event in faulty_stream(events, fault)]
