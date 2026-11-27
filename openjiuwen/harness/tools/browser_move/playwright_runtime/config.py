@@ -262,6 +262,9 @@ def build_playwright_mcp_config(
         server_path="stdio://playwright",
         client_type="stdio",
         params=params,
+        # Screenshots reach the model as images. Screenshot tools are only offered
+        # to models that accept images (BrowserRuntimeRail allowlist).
+        include_image_content=True,
     )
 
 

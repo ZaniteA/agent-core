@@ -6,7 +6,7 @@ from typing import Any, List, Optional
 
 from openjiuwen.core.common.logging import logger
 from openjiuwen.core.foundation.tool import McpToolCard
-from openjiuwen.core.foundation.tool.mcp.base import NO_TIMEOUT, preserve_mcp_tool_result_status
+from openjiuwen.core.foundation.tool.mcp.base import NO_TIMEOUT, extract_mcp_tool_result_content
 from openjiuwen.core.foundation.tool.mcp.client.stdio_client import StdioClient
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_logging import (
     browser_agent_log_info,
@@ -330,36 +330,15 @@ class BrowserMoveStdioClient(StdioClient):
                     self._session.call_tool(tool_name, arguments=arguments),
                     timeout=effective_timeout,
                 )
-                result_content = None
-                if tool_result.content and len(tool_result.content) > 0:
-                    chunks = []
-                    for item in tool_result.content:
-                        text = getattr(item, "text", None)
-                        if text:
-                            chunks.append(text)
-                            continue
-
-                        uri = getattr(item, "uri", None)
-                        if uri:
-                            chunks.append(str(uri))
-                            continue
-
-                        data = getattr(item, "data", None)
-                        if data is not None:
-                            mime = (
-                                getattr(item, "mimeType", None)
-                                or getattr(item, "mime_type", None)
-                                or "application/octet-stream"
-                            )
-                            chunks.append(f"[binary content: {mime}]")
-                            continue
-
-                        chunks.append(str(item))
-
-                    if chunks:
-                        result_content = "\n".join(chunks)
+                # This client replaces the core one for every stdio MCP server in the
+                # process, so it must convert results the same way, images included.
+                result_content = extract_mcp_tool_result_content(
+                    tool_result,
+                    include_image_content=self._include_image_content,
+                    tool_name=tool_name,
+                )
                 browser_agent_log_info(f"Tool '{tool_name}' call completed via Stdio")
-                return preserve_mcp_tool_result_status(tool_result, result_content)
+                return result_content
             except asyncio.TimeoutError as e:
                 if attempt == 0 and retry_safe:
                     browser_agent_log_warning(

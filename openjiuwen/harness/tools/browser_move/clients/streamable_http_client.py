@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from openjiuwen.core.common.logging import logger
 from openjiuwen.core.foundation.tool import McpServerConfig, McpToolCard
-from openjiuwen.core.foundation.tool.mcp.base import NO_TIMEOUT
+from openjiuwen.core.foundation.tool.mcp.base import NO_TIMEOUT, extract_mcp_tool_result_content
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_logging import (
     browser_agent_log_info,
     browser_agent_log_warning,
@@ -151,34 +151,13 @@ class BrowserMoveStreamableHttpClient(StreamableHttpClient):
                     f"{summarize_tool_arguments_for_log(tool_name, arguments)}"
                 )
                 tool_result = await self._session.call_tool(tool_name, arguments=arguments)
-                result_content = None
-                if tool_result.content and len(tool_result.content) > 0:
-                    chunks = []
-                    for item in tool_result.content:
-                        text = getattr(item, "text", None)
-                        if text:
-                            chunks.append(text)
-                            continue
-
-                        uri = getattr(item, "uri", None)
-                        if uri:
-                            chunks.append(str(uri))
-                            continue
-
-                        data = getattr(item, "data", None)
-                        if data is not None:
-                            mime = (
-                                getattr(item, "mimeType", None)
-                                or getattr(item, "mime_type", None)
-                                or "application/octet-stream"
-                            )
-                            chunks.append(f"[binary content: {mime}]")
-                            continue
-
-                        chunks.append(str(item))
-
-                    if chunks:
-                        result_content = "\n".join(chunks)
+                # This client replaces the core one for every streamable-HTTP MCP server
+                # in the process, so it must convert results the same way, images included.
+                result_content = extract_mcp_tool_result_content(
+                    tool_result,
+                    include_image_content=self._include_image_content,
+                    tool_name=tool_name,
+                )
                 browser_agent_log_info(f"Tool '{tool_name}' call completed via Streamable HTTP")
                 return result_content
             except Exception as e:

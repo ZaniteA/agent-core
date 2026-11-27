@@ -2808,7 +2808,9 @@ class ReActAgent(BaseAgent):
 
     @staticmethod
     def _iter_multimodal_image_items(tool_result: Any) -> List[dict[str, Any]]:
-        data = getattr(tool_result, "data", None)
+        # Images sit in ``ToolOutput.data`` / ``McpToolResult.data``, or directly in a
+        # plain dict result (rails such as BrowserRuntimeRail unwrap results to dicts).
+        data = tool_result if isinstance(tool_result, dict) else getattr(tool_result, "data", None)
         if not isinstance(data, dict):
             return []
 

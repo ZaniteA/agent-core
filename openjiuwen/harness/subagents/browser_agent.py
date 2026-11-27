@@ -20,6 +20,7 @@ from openjiuwen.core.sys_operation import SysOperation
 from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.factory import create_deep_agent
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
+from openjiuwen.harness.rails.multimodal_context_summarizer_rail import MultimodalContextSummarizerRail
 from openjiuwen.harness.schema.config import SubAgentConfig
 from openjiuwen.harness.tools.browser_move.offload_recall import BrowserOffloadRecallTool
 from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
@@ -509,6 +510,10 @@ def create_browser_agent(
     recall_tool = BrowserOffloadRecallTool(workspace, language=resolved_language)
     injected_rails: List[AgentRail] = [BrowserRuntimeRail(browser_backend, recall_tool=recall_tool)]
     injected_tools.append(recall_tool)
+    # Screenshots now reach the model as images: keep only the latest few in context.
+    # A caller's own summarizer rail (with its own keep count) wins.
+    if not any(isinstance(rail, MultimodalContextSummarizerRail) for rail in rails or []):
+        injected_rails.append(MultimodalContextSummarizerRail())
 
     browser_state_processor = (
         "BrowserStateContextProcessor",

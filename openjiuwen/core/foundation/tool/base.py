@@ -286,7 +286,9 @@ class Tool(metaclass=_ToolMeta):
         The default renders a ``ToolOutput`` through ``render_tool_output``:
         ``data["content"]`` on success and ``error`` on failure. Results that
         are not a ``ToolOutput`` (plain functions, REST APIs) render as
-        ``str(output)``.
+        ``str(output)``, except a plain dict carrying a ``multimodal`` list:
+        its images reach the model in a separate message, so it renders like a
+        ``ToolOutput`` payload without them.
 
         Args:
             output: The value returned by ``invoke``.
@@ -294,6 +296,9 @@ class Tool(metaclass=_ToolMeta):
         Returns:
             The model-facing text of the tool result.
         """
+        if isinstance(output, dict) and isinstance(output.get("multimodal"), list):
+            text_only = {key: value for key, value in output.items() if key != "multimodal"}
+            return render_payload_text(text_only) or EMPTY_SUCCESS_TEXT
         if not isinstance(output, ToolOutput):
             return str(output)
         return render_tool_output(output)

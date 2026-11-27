@@ -13,9 +13,11 @@ import json
 import re
 import time
 from collections import deque
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlsplit
 from weakref import WeakSet
+
+from pydantic import BaseModel
 
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import BaseError, build_error
@@ -35,6 +37,7 @@ from openjiuwen.core.single_agent.rail.base import (
     AgentRail,
 )
 from openjiuwen.harness.rails._multimodal import (
+    build_read_image_multimodal_resolver,
     should_enable_read_image_multimodal,
 )
 
@@ -2779,6 +2782,8 @@ class BrowserRuntimeRail(AgentRail):
         super().__init__()
         self._runtime = runtime
         self._recall_tool = recall_tool
+        # Set in before_invoke from the browser DeepAgent; see _image_input_supported.
+        self._image_input_resolver: Callable[[], bool] | None = None
         self._status_logger = BrowserSubagentStatusLogger() if is_browser_subagent_status_log_enabled() else None
         browser_agent_log_info(
             "[BROWSER_SUBAGENT_BOOT] enabled=%s logger=%s",
@@ -3688,6 +3693,30 @@ class BrowserRuntimeRail(AgentRail):
                 "observation_invalidated": invalidated, "observation_error": result.get("observation_error")})
 
     async def after_tool_call(self, ctx: AgentCallbackContext) -> None:
+        # The rail copies the result into the tool message text, receipts and
+        # evidence. Keep screenshot images out of all of those, and hand them
+        # back afterwards so the agent still sends them to the model.
+        inputs = getattr(ctx, "inputs", None)
+        images = self._take_tool_result_images(inputs)
+        await self._after_browser_tool_call(ctx)
+        if images and isinstance(getattr(inputs, "tool_result", None), dict):
+            inputs.tool_result = {**inputs.tool_result, "multimodal": images}
+
+    @staticmethod
+    def _take_tool_result_images(inputs: Any) -> list[Any]:
+        """Remove the ``multimodal`` items from the tool result and return them."""
+        result = getattr(inputs, "tool_result", None)
+        data = result if isinstance(result, dict) else getattr(result, "data", None)
+        if not isinstance(data, dict) or not isinstance(data.get("multimodal"), list):
+            return []
+        text_only = {key: value for key, value in data.items() if key != "multimodal"}
+        if isinstance(result, BaseModel):
+            inputs.tool_result = result.model_copy(update={"data": text_only})
+        else:
+            inputs.tool_result = text_only
+        return data["multimodal"]
+
+    async def _after_browser_tool_call(self, ctx: AgentCallbackContext) -> None:
         self._emit_status("after_tool_call", ctx)
         inputs = getattr(ctx, "inputs", None)
         tool_name = str(getattr(inputs, "tool_name", "") or "").strip()
@@ -7389,8 +7418,16 @@ class BrowserRuntimeRail(AgentRail):
             }
         )
 
-    @staticmethod
-    def _image_input_supported(agent: Any) -> bool:
+    def _image_input_supported(self, agent: Any) -> bool:
+        """Whether the browser agent's model may receive screenshots.
+
+        Model and tool hooks get the inner ReActAgent, which has no
+        ``deep_config`` and would always answer False. They use the browser
+        DeepAgent seen in ``before_invoke`` instead, so the system prompt and
+        the batch-screenshot check agree with the tool list.
+        """
+        if self._image_input_resolver is not None:
+            return self._image_input_resolver()
         return should_enable_read_image_multimodal(agent)
 
     async def _effective_browser_tool_allowlist(
@@ -7407,6 +7444,9 @@ class BrowserRuntimeRail(AgentRail):
 
     async def _ensure_browser_mcp_ability(self, ctx: AgentCallbackContext) -> None:
         agent = getattr(ctx, "agent", None)
+        # before_invoke runs on the browser DeepAgent: remember its image support
+        # for the later model and tool hooks, which only see the inner ReActAgent.
+        self._image_input_resolver = build_read_image_multimodal_resolver(agent)
         ability_manager = getattr(agent, "ability_manager", None)
         if ability_manager is None:
             return
