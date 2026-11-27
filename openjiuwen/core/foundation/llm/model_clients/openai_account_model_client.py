@@ -3,7 +3,10 @@
 
 import asyncio
 import threading
-from typing import Any, AsyncIterator, List, Optional, Union
+from contextlib import aclosing
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple, Union
+
+import httpx
 
 from openjiuwen.core.common.logging import LogEventType, llm_logger
 from openjiuwen.core.common.security.ssl_utils import SslUtils
@@ -31,7 +34,7 @@ from openjiuwen.core.foundation.llm.utils.responses_transport import OpenAIAccou
 from openjiuwen.core.foundation.llm.utils.provider_error import format_provider_exception
 from openjiuwen.core.foundation.llm.utils.request_parameter_fallback import RequestParameterFallback
 from openjiuwen.core.foundation.llm.output_parsers.output_parser import BaseOutputParser
-from openjiuwen.core.foundation.llm.schema.config import ProviderType
+from openjiuwen.core.foundation.llm.schema.config import ModelClientConfig, ProviderType
 from openjiuwen.core.foundation.llm.schema.generation_response import (
     AudioGenerationResponse,
     ImageGenerationResponse,
@@ -57,6 +60,12 @@ class OpenAIAccountModelClient(BaseModelClient):
     """
 
     __client_name__ = [ProviderType.OpenAIAccount.value]
+
+    # Process-wide cache of long-lived httpx clients borrowed by this client's
+    # Responses transports, one per connection identity (see ``connection_key``),
+    # like ``OpenAIModelClient._client_cache``. The access token is sent per
+    # request, so it is not part of the identity.
+    _responses_client_cache: Dict[Tuple, httpx.AsyncClient] = {}
 
     def _get_client_name(self) -> str:
         return "OpenAI account client"
@@ -242,25 +251,26 @@ class OpenAIAccountModelClient(BaseModelClient):
         final_message = None
         accumulated_for_parser = ""
         try:
-            async for chunk in self._stream_once_with_retry(
+            async with aclosing(self._stream_once_with_retry(
                 body=body,
                 timeout=timeout,
                 session_id=session_id,
                 request_custom_headers=request_custom_headers,
-            ):
-                await trigger(
-                    LLMCallEvents.LLM_RESPONSE_RECEIVED,
-                    model_name=body.get("model"),
-                    model_provider=self.model_client_config.client_provider,
-                )
-                if output_parser and chunk.content:
-                    accumulated_for_parser += str(chunk.content)
-                    parser_content = await self._try_parse_stream_content(accumulated_for_parser, output_parser)
-                    if parser_content is not None:
-                        chunk.parser_content = parser_content
-                        accumulated_for_parser = ""
-                final_message = final_message + chunk if final_message else chunk
-                yield chunk
+            )) as chunks:
+                async for chunk in chunks:
+                    await trigger(
+                        LLMCallEvents.LLM_RESPONSE_RECEIVED,
+                        model_name=body.get("model"),
+                        model_provider=self.model_client_config.client_provider,
+                    )
+                    if output_parser and chunk.content:
+                        accumulated_for_parser += str(chunk.content)
+                        parser_content = await self._try_parse_stream_content(accumulated_for_parser, output_parser)
+                        if parser_content is not None:
+                            chunk.parser_content = parser_content
+                            accumulated_for_parser = ""
+                    final_message = final_message + chunk if final_message else chunk
+                    yield chunk
         except Exception as exc:
             await self._emit_error(body, messages, tools, exc, is_stream=True)
             raise self._wrap_model_error(exc, "stream") from exc
@@ -424,8 +434,9 @@ class OpenAIAccountModelClient(BaseModelClient):
         request_custom_headers: Optional[dict[str, Any]],
     ) -> AssistantMessage:
         access_token = await asyncio.to_thread(self._auth_manager.resolve_access_token)
+        transport = self._get_transport(timeout=timeout)
         try:
-            return await self._get_transport(timeout=timeout).create_response(
+            return await transport.create_response(
                 body=body,
                 access_token=access_token,
                 model_name=str(body.get("model") or ""),
@@ -439,7 +450,7 @@ class OpenAIAccountModelClient(BaseModelClient):
                 lambda: self._auth_manager.resolve_access_token(force_refresh=True)
             )
             try:
-                return await self._get_transport(timeout=timeout).create_response(
+                return await transport.create_response(
                     body=body,
                     access_token=refreshed_token,
                     model_name=str(body.get("model") or ""),
@@ -450,6 +461,8 @@ class OpenAIAccountModelClient(BaseModelClient):
                 if retry_exc.status_code in _AUTH_RETRY_STATUS_CODES:
                     raise self._relogin_required_error(retry_exc) from retry_exc
                 raise
+        finally:
+            await self._release_transport(transport)
 
     async def _stream_once_with_retry(
         self,
@@ -460,15 +473,19 @@ class OpenAIAccountModelClient(BaseModelClient):
         request_custom_headers: Optional[dict[str, Any]],
     ) -> AsyncIterator[AssistantMessageChunk]:
         access_token = await asyncio.to_thread(self._auth_manager.resolve_access_token)
+        transport = self._get_transport(timeout=timeout)
         try:
-            async for chunk in self._get_transport(timeout=timeout).stream_response(
+            # aclosing: when the reader stops early, the HTTP response is
+            # closed at once instead of waiting for garbage collection.
+            async with aclosing(transport.stream_response(
                 body=body,
                 access_token=access_token,
                 model_name=str(body.get("model") or ""),
                 session_id=session_id,
                 extra_headers=self._request_headers(request_custom_headers),
-            ):
-                yield chunk
+            )) as chunks:
+                async for chunk in chunks:
+                    yield chunk
         except OpenAIAccountResponsesError as exc:
             if exc.status_code not in _AUTH_RETRY_STATUS_CODES:
                 raise
@@ -476,29 +493,68 @@ class OpenAIAccountModelClient(BaseModelClient):
                 lambda: self._auth_manager.resolve_access_token(force_refresh=True)
             )
             try:
-                async for chunk in self._get_transport(timeout=timeout).stream_response(
+                async with aclosing(transport.stream_response(
                     body=body,
                     access_token=refreshed_token,
                     model_name=str(body.get("model") or ""),
                     session_id=session_id,
                     extra_headers=self._request_headers(request_custom_headers),
-                ):
-                    yield chunk
+                )) as chunks:
+                    async for chunk in chunks:
+                        yield chunk
             except OpenAIAccountResponsesError as retry_exc:
                 if retry_exc.status_code in _AUTH_RETRY_STATUS_CODES:
                     raise self._relogin_required_error(retry_exc) from retry_exc
                 raise
+        finally:
+            await self._release_transport(transport)
+
+    def _use_shared_client(self) -> bool:
+        """Whether transports borrow the process-wide cached HTTP client (default True).
+
+        Emergency kill-switch: set ``use_shared_llm_http_client=False`` to fall
+        back to a fresh client per call, closed after the call.
+        """
+        return bool(getattr(self.model_client_config, "use_shared_llm_http_client", True))
+
+    @classmethod
+    def connection_key(cls, model_client_config: ModelClientConfig) -> Tuple:
+        """Connection identity used to bucket/reuse cached HTTP clients.
+
+        ``api_base`` already determines the proxy, so proxy is not part of the
+        key. Exposed as a classmethod so callers can compute the same key to
+        select connections to close via :meth:`aclose_connections`.
+        """
+        cfg = model_client_config
+        return (
+            (cfg.api_base or "").rstrip("/"),
+            cfg.verify_ssl,
+            cfg.ssl_cert,
+        )
 
     def _get_transport(self, *, timeout: Optional[float]) -> OpenAIAccountResponsesTransport:
         if self._transport_override is not None:
             return self._transport_override
         effective_timeout = timeout if timeout is not None else self.model_client_config.timeout
+        if not self._use_shared_client():
+            # Owns its client; _release_transport closes it after the call.
+            return self._make_transport(timeout=effective_timeout)
         if effective_timeout == self.model_client_config.timeout:
             with self._default_transport_lock:
                 if self._default_transport is None:
                     self._default_transport = self._make_transport(timeout=effective_timeout)
             return self._default_transport
+        # Borrows the shared client, so a call with its own timeout opens no new pool.
         return self._make_transport(timeout=effective_timeout)
+
+    async def _release_transport(self, transport: OpenAIAccountResponsesTransport) -> None:
+        """Close a client the transport owns (fallback path).
+
+        A borrowed shared client stays open, and a caller-supplied
+        ``openai_account_transport`` is left to its owner.
+        """
+        if transport is not self._transport_override:
+            await transport.aclose()
 
     def _make_transport(self, *, timeout: float) -> OpenAIAccountResponsesTransport:
         verify = (
@@ -506,6 +562,7 @@ class OpenAIAccountModelClient(BaseModelClient):
             if self.model_client_config.verify_ssl
             else False
         )
+        use_shared = self._use_shared_client()
         return OpenAIAccountResponsesTransport(
             base_url=self.model_client_config.api_base,
             timeout_seconds=timeout,
@@ -513,7 +570,47 @@ class OpenAIAccountModelClient(BaseModelClient):
             proxy=UrlUtils.get_global_proxy_url(self.model_client_config.api_base),
             max_retries=0,
             request_fallback=self._request_fallback,
+            shared_clients=self._responses_client_cache if use_shared else None,
+            shared_client_key=self.connection_key(self.model_client_config) if use_shared else None,
         )
+
+    @classmethod
+    async def aclose(cls) -> None:
+        """Close all cached HTTP clients and their connection pools.
+
+        Intended for agent/process teardown only. NEVER call this on the request
+        hot path: it tears down the shared client that other in-flight calls
+        rely on.
+        """
+        clients = list(cls._responses_client_cache.values())
+        cls._responses_client_cache.clear()
+
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception as e:  # pragma: no cover - defensive cleanup
+                llm_logger.warning("Error closing cached OpenAI account HTTP client: %s", e)
+
+    @classmethod
+    async def aclose_connections(cls, configs: Iterable[ModelClientConfig]) -> None:
+        """Close and drop cached HTTP clients for exactly the given connection identities.
+
+        Everything else is left untouched. Closing is immediate even if a call
+        is in flight; that call surfaces as a normal model-call failure.
+        """
+        keys = {cls.connection_key(cfg) for cfg in configs}
+        closed = 0
+        for key in keys:
+            client = cls._responses_client_cache.pop(key, None)
+            if client is None:
+                continue
+            try:
+                await client.aclose()
+                closed += 1
+            except Exception as e:  # pragma: no cover - defensive cleanup
+                llm_logger.warning("Error closing OpenAI account HTTP client: %s", e)
+        if closed:
+            llm_logger.info("Closed %s OpenAI account HTTP client(s) for removed/updated model config", closed)
 
     def _get_model_catalog(self) -> OpenAIAccountModelCatalog:
         if self._model_catalog_override is not None:

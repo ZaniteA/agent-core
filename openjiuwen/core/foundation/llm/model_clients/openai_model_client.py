@@ -2,6 +2,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 
 import json
+from contextlib import aclosing
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import (
@@ -403,6 +404,10 @@ class OpenAIModelClient(BaseModelClient):
     # build/close). Shared across subclasses (OpenRouter/DashScope/DeepSeek) on
     # purpose: one cache per process.
     _client_cache: Dict[Tuple, "openai.AsyncOpenAI"] = {}
+    # The same for Responses mode (``api_mode="responses"``): long-lived httpx
+    # clients borrowed by each per-call Responses transport, keyed by
+    # ``connection_key`` like ``_client_cache``.
+    _responses_client_cache: Dict[Tuple, httpx.AsyncClient] = {}
 
     def __init__(self, model_config: ModelRequestConfig, model_client_config: ModelClientConfig):
         super().__init__(model_config, model_client_config)
@@ -1230,16 +1235,23 @@ class OpenAIModelClient(BaseModelClient):
 
         Intended for agent/process teardown only. NEVER call this on the request
         hot path: it tears down the shared client that other in-flight calls
-        rely on.
+        rely on. Covers both the Chat and the Responses caches.
         """
         clients = list(cls._client_cache.values())
         cls._client_cache.clear()
+        responses_clients = list(cls._responses_client_cache.values())
+        cls._responses_client_cache.clear()
 
         for client in clients:
             try:
                 await client.close()
             except Exception as e:  # pragma: no cover - defensive cleanup
                 logger.warning(f"Error closing cached AsyncOpenAI client: {e}")
+        for http_client in responses_clients:
+            try:
+                await http_client.aclose()
+            except Exception as e:  # pragma: no cover - defensive cleanup
+                logger.warning("Error closing cached Responses HTTP client: %s", e)
 
     @classmethod
     async def aclose_connections(cls, configs: Iterable[ModelClientConfig]) -> None:
@@ -1269,6 +1281,19 @@ class OpenAIModelClient(BaseModelClient):
                 logger.warning(f"Error closing AsyncOpenAI client: {e}")
         if closed:
             logger.info(f"Closed {closed} AsyncOpenAI client(s) for removed/updated model config")
+
+        responses_closed = 0
+        for key in keys:
+            http_client = cls._responses_client_cache.pop(key, None)
+            if http_client is None:
+                continue
+            try:
+                await http_client.aclose()
+                responses_closed += 1
+            except Exception as e:  # pragma: no cover - defensive cleanup
+                logger.warning("Error closing Responses HTTP client: %s", e)
+        if responses_closed:
+            logger.info("Closed %s Responses HTTP client(s) for removed/updated model config", responses_closed)
 
     def _uses_responses_api(self) -> bool:
         """Whether this client talks to the OpenAI Responses endpoint (``/responses``)."""
@@ -1364,11 +1389,20 @@ class OpenAIModelClient(BaseModelClient):
         )
 
     def _make_responses_transport(self, *, timeout: Optional[float]) -> OpenAIAccountResponsesTransport:
+        """Build a per-call Responses transport.
+
+        Default (shared) path: the transport borrows the process-wide client
+        for this connection identity, so closing the transport after the call
+        leaves the connection pool open. Emergency fallback path
+        (``use_shared_llm_http_client=False``): the transport owns a fresh
+        client, which the caller closes after the call.
+        """
         verify = (
             SslUtils.create_strict_ssl_context(self.model_client_config.ssl_cert)
             if self.model_client_config.verify_ssl
             else False
         )
+        use_shared = self._use_shared_client()
         return OpenAIAccountResponsesTransport(
             base_url=self.model_client_config.api_base,
             timeout_seconds=timeout if timeout is not None else self.model_client_config.timeout,
@@ -1376,6 +1410,8 @@ class OpenAIModelClient(BaseModelClient):
             proxy=UrlUtils.get_global_proxy_url(self.model_client_config.api_base),
             max_retries=0,
             request_fallback=self._responses_request_fallback,
+            shared_clients=self._responses_client_cache if use_shared else None,
+            shared_client_key=self._client_cache_key() if use_shared else None,
         )
 
     async def _parse_responses_content(self, content: str, output_parser: BaseOutputParser) -> Any:
@@ -1445,8 +1481,10 @@ class OpenAIModelClient(BaseModelClient):
             is_stream=False,
         )
 
+        transport = None
         try:
-            response = await self._make_responses_transport(timeout=timeout).create_response(
+            transport = self._make_responses_transport(timeout=timeout)
+            response = await transport.create_response(
                 body=body,
                 access_token=self._resolved_api_key(),
                 model_name=str(body.get("model") or ""),
@@ -1459,6 +1497,11 @@ class OpenAIModelClient(BaseModelClient):
                 StatusCode.MODEL_CALL_FAILED,
                 error_msg=f"Responses API invoke error: {_format_exception_detail(exc)}",
             ) from exc
+        finally:
+            # Closes only a client the transport owns (fallback path); a
+            # borrowed shared client stays open.
+            if transport is not None:
+                await transport.aclose()
 
         llm_logger.info(
             "Responses API response received.",
@@ -1540,35 +1583,45 @@ class OpenAIModelClient(BaseModelClient):
 
         final_message = None
         accumulated_for_parser = ""
+        transport = None
         try:
-            async for chunk in self._make_responses_transport(timeout=timeout).stream_response(
+            transport = self._make_responses_transport(timeout=timeout)
+            # aclosing: when the reader stops early, the HTTP response is
+            # closed at once instead of waiting for garbage collection.
+            async with aclosing(transport.stream_response(
                 body=body,
                 access_token=self._resolved_api_key(),
                 model_name=str(body.get("model") or ""),
                 session_id=session_id,
                 extra_headers=request_headers,
-            ):
-                await trigger(
-                    LLMCallEvents.LLM_RESPONSE_RECEIVED,
-                    model_name=body.get("model"),
-                    model_provider=self.model_client_config.client_provider,
-                )
-                if output_parser and chunk.content:
-                    accumulated_for_parser += str(chunk.content)
-                    parser_content = await self._try_parse_responses_stream_content(
-                        accumulated_for_parser, output_parser
+            )) as chunks:
+                async for chunk in chunks:
+                    await trigger(
+                        LLMCallEvents.LLM_RESPONSE_RECEIVED,
+                        model_name=body.get("model"),
+                        model_provider=self.model_client_config.client_provider,
                     )
-                    if parser_content is not None:
-                        chunk.parser_content = parser_content
-                        accumulated_for_parser = ""
-                final_message = final_message + chunk if final_message else chunk
-                yield chunk
+                    if output_parser and chunk.content:
+                        accumulated_for_parser += str(chunk.content)
+                        parser_content = await self._try_parse_responses_stream_content(
+                            accumulated_for_parser, output_parser
+                        )
+                        if parser_content is not None:
+                            chunk.parser_content = parser_content
+                            accumulated_for_parser = ""
+                    final_message = final_message + chunk if final_message else chunk
+                    yield chunk
         except Exception as exc:
             await self._emit_responses_error(body, messages, tools, exc, is_stream=True)
             raise build_error(
                 StatusCode.MODEL_CALL_FAILED,
                 error_msg=f"Responses API stream error: {_format_exception_detail(exc)}",
             ) from exc
+        finally:
+            # Closes only a client the transport owns (fallback path); a
+            # borrowed shared client stays open.
+            if transport is not None:
+                await transport.aclose()
 
         if tracer_record_data:
             await tracer_record_data(llm_response=final_message)
@@ -1832,7 +1885,7 @@ class OpenAIModelClient(BaseModelClient):
         # Responses API mode: go through the dedicated /responses transport
         # instead of the chat-completions SDK path.
         if self._uses_responses_api():
-            async for chunk in self._stream_responses_api(
+            async with aclosing(self._stream_responses_api(
                 messages=messages,
                 tools=tools,
                 temperature=temperature,
@@ -1845,8 +1898,9 @@ class OpenAIModelClient(BaseModelClient):
                 tracer_record_data=tracer_record_data,
                 request_custom_headers=request_custom_headers,
                 **kwargs,
-            ):
-                yield chunk
+            )) as chunks:
+                async for chunk in chunks:
+                    yield chunk
             return
 
         # Build request parameters

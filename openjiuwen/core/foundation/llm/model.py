@@ -54,6 +54,21 @@ def _ensure_llm_route_stream_writer_registered() -> None:
     _llm_route_stream_writer_framework_id = framework_id
 
 
+async def _close_client_stream(stream_iterator, stream_iterable) -> None:
+    """Close a client stream the reader has stopped reading.
+
+    Best effort: a failure while closing is logged so it cannot replace the
+    error, if any, that ended the stream.
+    """
+    close = getattr(stream_iterator, "aclose", None) or getattr(stream_iterable, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        await close()
+    except Exception as exc:
+        llm_logger.warning("Failed to close LLM client stream: %s", exc)
+
+
 class Model:
     """Unified LLM invocation entry point
 
@@ -239,6 +254,8 @@ class Model:
             runtime_lease = await KVCacheModelHook.begin(self, kwargs, effective_model_name)
             succeeded = False
             accumulated_chunk: AssistantMessageChunk | None = None
+            stream_iterable = None
+            stream_iterator = None
             try:
                 stream_iterable = self._client.stream(
                     messages=messages,
@@ -345,7 +362,14 @@ class Model:
                         )
                     yield chunk
             finally:
-                await KVCacheModelHook.end(runtime_lease, succeeded=succeeded)
+                try:
+                    # The reader may stop early (break, error, cancel): close the
+                    # provider stream now instead of leaving its connection open
+                    # until garbage collection. A finished stream ignores this.
+                    if stream_iterator is not None:
+                        await _close_client_stream(stream_iterator, stream_iterable)
+                finally:
+                    await KVCacheModelHook.end(runtime_lease, succeeded=succeeded)
 
             completed_message = (
                 AssistantMessage.model_validate(accumulated_chunk.model_dump())

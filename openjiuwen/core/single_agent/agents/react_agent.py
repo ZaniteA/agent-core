@@ -17,7 +17,7 @@ import inspect
 import json
 import time
 import uuid
-from contextlib import aclosing
+from contextlib import aclosing, nullcontext
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Union, cast
 
@@ -2159,53 +2159,59 @@ class ReActAgent(BaseAgent):
         ctx.extra["_stream_chunks_emitted"] = 0
         ctx.extra[MODEL_VISIBLE_OUTPUT_EMITTED_KEY] = False
         try:
-            async for chunk in llm.stream(
+            chunks = llm.stream(
                 model=self._config.model_name,
                 messages=ctx.inputs.messages,
                 tools=cast(ModelCallInputs, ctx.inputs).tools or None,
                 **extra_kwargs,
-            ):
-                if accumulated_chunk is None:
-                    accumulated_chunk = chunk
-                else:
-                    accumulated_chunk = accumulated_chunk + chunk
+            )
+            # Close the model stream as soon as this loop stops (an inspector or
+            # session write fails, or the task is cancelled), so its connection
+            # is not left open until garbage collection.
+            stream_context = aclosing(chunks) if callable(getattr(chunks, "aclose", None)) else nullcontext(chunks)
+            async with stream_context as stream:
+                async for chunk in stream:
+                    if accumulated_chunk is None:
+                        accumulated_chunk = chunk
+                    else:
+                        accumulated_chunk = accumulated_chunk + chunk
 
-                if call_first_token_time is None:
-                    call_first_token_time = time.monotonic()
-                call_last_token_time = time.monotonic()
-                call_chunk_count += 1
-                ctx.extra["_stream_chunks_emitted"] = call_chunk_count
+                    if call_first_token_time is None:
+                        call_first_token_time = time.monotonic()
+                    call_last_token_time = time.monotonic()
+                    call_chunk_count += 1
+                    ctx.extra["_stream_chunks_emitted"] = call_chunk_count
 
-                inspectors = ctx.extra.get("_stream_chunk_inspectors") or []
-                if isinstance(inspectors, dict):
-                    inspectors = inspectors.values()
-                for inspector in list(inspectors):
-                    if not callable(inspector):
-                        continue
-                    inspect_result = inspector(ctx, chunk)
-                    if asyncio.iscoroutine(inspect_result):
-                        await inspect_result
+                    inspectors = ctx.extra.get("_stream_chunk_inspectors") or []
+                    if isinstance(inspectors, dict):
+                        inspectors = inspectors.values()
+                    for inspector in list(inspectors):
+                        if not callable(inspector):
+                            continue
+                        inspect_result = inspector(ctx, chunk)
+                        if asyncio.iscoroutine(inspect_result):
+                            await inspect_result
 
-                if chunk.reasoning_content:
-                    ctx.extra[MODEL_VISIBLE_OUTPUT_EMITTED_KEY] = True
-                    await session.write_stream(
-                        OutputSchema(
-                            type="llm_reasoning",
-                            index=chunk_index,
-                            payload={"content": chunk.reasoning_content, "result_type": "answer"},
+                    if chunk.reasoning_content:
+                        ctx.extra[MODEL_VISIBLE_OUTPUT_EMITTED_KEY] = True
+                        await session.write_stream(
+                            OutputSchema(
+                                type="llm_reasoning",
+                                index=chunk_index,
+                                payload={"content": chunk.reasoning_content, "result_type": "answer"},
+                            )
                         )
-                    )
-                    chunk_index += 1
-                if chunk.content:
-                    ctx.extra[MODEL_VISIBLE_OUTPUT_EMITTED_KEY] = True
-                    await session.write_stream(
-                        OutputSchema(
-                            type="llm_output",
-                            index=chunk_index,
-                            payload={"content": chunk.content, "result_type": "answer"},
+                        chunk_index += 1
+                    if chunk.content:
+                        ctx.extra[MODEL_VISIBLE_OUTPUT_EMITTED_KEY] = True
+                        await session.write_stream(
+                            OutputSchema(
+                                type="llm_output",
+                                index=chunk_index,
+                                payload={"content": chunk.content, "result_type": "answer"},
+                            )
                         )
-                    )
-                    chunk_index += 1
+                        chunk_index += 1
         except Exception as exc:
             if image_input_present and self._is_image_input_unsupported_error(exc):
                 ai_message = self._build_image_input_unsupported_message()
