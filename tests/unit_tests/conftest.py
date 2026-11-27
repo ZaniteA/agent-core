@@ -21,6 +21,25 @@ def _reset_termination_reason_carrier():
     reset_termination_reason()
 
 
+@pytest.fixture(autouse=True)
+def _clear_responses_client_caches():
+    """Keep the shared Responses HTTP clients from leaking across tests.
+
+    The OpenAI and OpenAI account clients cache one HTTP client per connection
+    for the whole process. Each async test runs on a new event loop, so a client
+    left by an earlier test would hold connections from a closed loop.
+    """
+    from openjiuwen.core.foundation.llm.model_clients.openai_account_model_client import OpenAIAccountModelClient
+    from openjiuwen.core.foundation.llm.model_clients.openai_model_client import OpenAIModelClient
+
+    caches = (OpenAIModelClient._responses_client_cache, OpenAIAccountModelClient._responses_client_cache)
+    for cache in caches:
+        cache.clear()
+    yield
+    for cache in caches:
+        cache.clear()
+
+
 @pytest_asyncio.fixture
 async def deep_factory(tmp_path):
     from uuid import uuid4
