@@ -8,10 +8,11 @@ fake server, on the plain call path and on the streaming path. Both modes must
 make the same tool call, show the model the same conversation, give the same
 answer, and never send the other protocol's keys.
 
-The last two tests record known gaps as they are today: a browser screenshot
-reaches a Chat model only as a text placeholder, and an MCP tool's audio and
-file content reaches it as text with the base64 data inside. Both stub the MCP
-session through the client's private ``_session``, so no MCP server runs.
+The last two tests cover MCP tools. A browser screenshot reaches a Chat model
+as an image, with no base64 in the tool text. An MCP tool's audio and file
+content is a known gap, recorded as it is today: it reaches the model as text
+with the base64 data inside. Both stub the MCP session through the client's
+private ``_session``, so no MCP server runs.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from openjiuwen.core.single_agent.agents.react_agent import ReActAgent, ReActAge
 from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.harness.tools.base_tool import ToolOutput
 from openjiuwen.harness.tools.browser_move.clients.stdio_client import BrowserMoveStdioClient
+from openjiuwen.harness.tools.browser_move.playwright_runtime.config import build_playwright_mcp_config
 from tests.unit_tests.fixtures.fake_llm_servers import (  # noqa: F401  (fake_model_server is a fixture)
     FakeToolCall,
     fake_model_server,
@@ -242,37 +244,36 @@ async def test_camera_task_sends_no_key_of_the_other_protocol(
 
 
 @pytest.mark.asyncio
-async def test_browser_screenshot_reaches_chat_as_text_today(fake_model_server, runner):
-    # Known gap, recorded as it is: the browser client turns the screenshot
-    # into a text placeholder, so the next Chat request carries no image. A
-    # later change makes screenshots reach vision models and updates this test.
-    client = BrowserMoveStdioClient(
-        McpServerConfig(
-            server_id="browser", server_name="browser", server_path="stdio://playwright", client_type="stdio",
-        )
-    )
+async def test_browser_screenshot_reaches_chat_as_an_image(fake_model_server, runner):
+    # The browser client uses the real Playwright MCP config, which asks for
+    # images, so the next Chat request carries the screenshot as an image part
+    # and the tool text holds no base64.
+    client = BrowserMoveStdioClient(build_playwright_mcp_config())
     screenshot = CallToolResult(content=[ImageContent(type="image", data="iVBORw0KGgo=", mimeType="image/png")])
     client._session = SimpleNamespace(call_tool=AsyncMock(return_value=screenshot))
     card = McpToolCard(
-        id="browser_take_screenshot_gap",
+        id="browser_take_screenshot_image",
         name="browser_take_screenshot",
-        server_name="browser",
+        server_name="playwright-official",
         description="Take a screenshot of the page.",
         input_params={"type": "object", "properties": {}},
     )
-    agent = _agent("browser_screenshot_gap_agent", None)
+    agent = _agent("browser_screenshot_image_agent", None)
     Runner.resource_mgr.add_tool(MCPTool(client, card), tag=agent.card.id)
     agent.ability_manager.add(card)
     fake_model_server.add_reply(tool_calls=[FakeToolCall(name="browser_take_screenshot")])
-    fake_model_server.add_reply(text="I cannot see the image.")
+    fake_model_server.add_reply(text="The page shows a cat.")
     try:
-        await _answer(agent, "What does the page show?", streaming=False, conversation_id="browser_gap")
+        await _answer(agent, "What does the page show?", streaming=False, conversation_id="browser_image")
     finally:
         Runner.resource_mgr.remove_tool(card.id)
 
     last_request = fake_model_server.requests[-1].body
-    assert _conversation(last_request)[-1] == ("tool result", "call_1", "[binary content: image/png]")
-    assert not [item for item in _conversation(last_request) if item[1:2] == ("image",)]
+    assert _conversation(last_request)[-3:] == [
+        ("tool result", "call_1", "1 image(s) attached as multimodal input."),
+        ("user", "Image loaded from mcp: browser_take_screenshot"),
+        ("user", "image", "data:image/png;base64,iVBORw0KGgo="),
+    ]
 
 
 @pytest.mark.asyncio
