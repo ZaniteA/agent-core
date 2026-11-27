@@ -53,6 +53,9 @@ REDACTED = "<redacted>"
 # A header whose name contains one of these words holds a secret. A saved copy
 # keeps the header name, so its presence still shows, but never the value.
 _SECRET_HEADER_WORDS = ("auth", "cookie", "key", "secret", "token")
+# Placeholder credentials agent-core sends when it has no key. They are not
+# secrets, so a saved copy shows them as they are.
+_PLACEHOLDER_CREDENTIALS = frozenset({"Bearer EMPTY"})
 # Headers that httpx or the OpenAI SDK set for themselves. They change with the
 # library version or the machine, not with anything agent-core decides.
 _LIBRARY_HEADERS = frozenset({"accept-encoding", "connection", "content-length", "host", "user-agent"})
@@ -82,14 +85,16 @@ class RecordedRequest:
     def saved_copy(self) -> dict[str, Any]:
         """Return the address, JSON body and non-secret headers of this request.
 
-        Secret header values become ``<redacted>``. Headers that httpx or the
-        OpenAI SDK set for themselves are left out.
+        Secret header values become ``<redacted>``; a placeholder such as
+        ``Bearer EMPTY`` is kept. Headers that httpx or the OpenAI SDK set for
+        themselves are left out.
         """
         headers = {}
         for name, value in sorted(self.headers.items()):
             if name in _LIBRARY_HEADERS or name.startswith(_LIBRARY_HEADER_PREFIXES):
                 continue
-            headers[name] = REDACTED if any(word in name for word in _SECRET_HEADER_WORDS) else value
+            secret = any(word in name for word in _SECRET_HEADER_WORDS) and value not in _PLACEHOLDER_CREDENTIALS
+            headers[name] = REDACTED if secret else value
         return {"method": self.method, "url": self.url, "headers": headers, "body": self.body}
 
 
@@ -112,7 +117,9 @@ class StreamFault:
     ``after`` counts the events sent before the fault: Chat chunks or
     Responses events. The closing event (``data: [DONE]`` or
     ``response.completed``) is the last event. Faults only apply to streamed
-    replies; a plain JSON Chat reply ignores them.
+    replies. A fault that can never fire (on a plain JSON Chat reply, or with
+    ``after`` outside the stream) is recorded by the server, and the
+    ``fake_model_server`` fixture then fails the test.
     """
 
     kind: Literal["cut", "no_closing_event", "garbled_line", "stall"]
@@ -139,6 +146,19 @@ class StreamFault:
         """Send nothing for ``seconds`` after ``after`` events, then carry on."""
         return cls("stall", after, seconds)
 
+    def describe(self) -> str:
+        """The fault as a test writes it, for error messages."""
+        if self.kind == "no_closing_event":
+            return "StreamFault.no_closing_event()"
+        return f"StreamFault.{self.kind}(after={self.after})"
+
+
+def _unfired_fault(events: list[bytes], fault: Optional[StreamFault]) -> Optional[str]:
+    """Say why ``fault`` can never fire on ``events``, or return None."""
+    if fault is None or fault.kind == "no_closing_event" or 0 <= fault.after <= len(events):
+        return None
+    return f"{fault.describe()} never fires on a stream of {len(events)} events"
+
 
 async def faulty_stream(events: list[bytes], fault: Optional[StreamFault]) -> AsyncIterator[bytes]:
     """Send ``events`` one at a time, broken the way ``fault`` says.
@@ -146,13 +166,14 @@ async def faulty_stream(events: list[bytes], fault: Optional[StreamFault]) -> As
     Raises:
         ValueError: When ``fault.after`` is outside ``0..len(events)``. Such a
             fault would never fire, and the test would get a normal answer.
+            Through a real client this error looks like any broken stream, so
+            ``FakeModelServer`` also records it (see ``unfired_faults``).
     """
+    problem = _unfired_fault(events, fault)
+    if problem:
+        raise ValueError(problem)
     if fault is not None and fault.kind == "no_closing_event":
         events = events[:-1]
-    elif fault is not None and not 0 <= fault.after <= len(events):
-        raise ValueError(
-            f"StreamFault.{fault.kind}(after={fault.after}) never fires on a stream of {len(events)} events"
-        )
     for index in range(len(events) + 1):
         if fault is not None and index == fault.after:
             if fault.kind == "cut":
@@ -180,6 +201,8 @@ class FakeModelServer:
 
     def __init__(self) -> None:
         self.requests: list[RecordedRequest] = []
+        # Scripted faults that could not fire, one line each.
+        self.unfired_faults: list[str] = []
         self._replies: list[_Reply] = []
 
     def add_reply(
@@ -205,6 +228,17 @@ class FakeModelServer:
         """An httpx transport that sends requests to this server, for explicit transport hooks."""
         return httpx.MockTransport(self.handle)
 
+    def assert_every_fault_fired(self) -> None:
+        """Fail if a scripted fault could not fire on the reply it was given.
+
+        Through a real client, a fault that never fires can look like a
+        working one: the call fails with the same error a broken stream gives,
+        or succeeds as if nothing was wrong. The ``fake_model_server`` fixture
+        calls this at teardown.
+        """
+        if self.unfired_faults:
+            raise AssertionError("A scripted StreamFault never fired: " + "; ".join(self.unfired_faults))
+
     async def handle(self, request: httpx.Request) -> httpx.Response:
         body = _json_or_none(request.content)
         self.requests.append(
@@ -228,7 +262,12 @@ class FakeModelServer:
             include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
             events = _chat_chunks(reply, model, number, include_usage=include_usage)
         else:
+            if reply.fault is not None:
+                self.unfired_faults.append(f"{reply.fault.describe()} never fires on a reply that is not streamed")
             return httpx.Response(200, json=_chat_completion(reply, model, number))
+        problem = _unfired_fault(events, reply.fault)
+        if problem:
+            self.unfired_faults.append(problem)
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -278,11 +317,15 @@ async def reset_model_client_caches() -> None:
 
 @pytest_asyncio.fixture
 async def fake_model_server(monkeypatch) -> AsyncIterator[FakeModelServer]:
-    """A ``FakeModelServer`` that receives every model request of the test."""
+    """A ``FakeModelServer`` that receives every model request of the test.
+
+    At teardown it fails the test if a scripted fault never fired.
+    """
     await reset_model_client_caches()
     server = install_fake_server(monkeypatch, FakeModelServer())
     yield server
     await reset_model_client_caches()
+    server.assert_every_fault_fired()
 
 
 def _json_or_none(content: bytes) -> Any:

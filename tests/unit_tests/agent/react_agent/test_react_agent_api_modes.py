@@ -313,6 +313,11 @@ async def test_mcp_audio_and_file_reach_chat_as_base64_text_today(fake_model_ser
     finally:
         Runner.resource_mgr.remove_tool(card.id)
 
-    kind, call_id, text = _conversation(fake_model_server.requests[-1].body)[-1]
+    last_request = fake_model_server.requests[-1].body
+    kind, call_id, text = _conversation(last_request)[-1]
     assert (kind, call_id) == ("tool result", "call_1")
     assert _AUDIO_BASE64 in text and _PDF_BASE64 in text
+    keys: set[str] = set()
+    types: set[str] = set()
+    _keys_and_types(last_request, keys, types)
+    assert not types & {"input_audio", "audio", "file", "input_file"}

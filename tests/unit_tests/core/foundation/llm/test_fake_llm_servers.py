@@ -249,3 +249,39 @@ async def test_fault_that_never_fires_is_refused(fault):
 
     with pytest.raises(ValueError, match="never fires on a stream of 3 events"):
         _ = [event async for event in faulty_stream(events, fault)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_mode", _PROTOCOLS)
+async def test_fault_outside_the_stream_is_reported_although_the_call_fails_anyway(monkeypatch, api_mode):
+    # Through a real client the refused fault fails the call with the same
+    # error a broken stream gives, so a test expecting an error would pass.
+    # The server records it, and the fixture fails such a test at teardown.
+    await reset_model_client_caches()
+    server = install_fake_server(monkeypatch, FakeModelServer())
+    server.add_reply(text="Hello", fault=StreamFault.cut(after=50))
+
+    try:
+        with pytest.raises(BaseError) as caught:
+            await _call(_model(api_mode), stream=True)
+    finally:
+        await reset_model_client_caches()
+
+    assert caught.value.status == StatusCode.MODEL_CALL_FAILED
+    with pytest.raises(AssertionError, match=r"StreamFault\.cut\(after=50\) never fires on a stream of \d+ events"):
+        server.assert_every_fault_fired()
+
+
+@pytest.mark.asyncio
+async def test_fault_on_a_reply_that_is_not_streamed_is_reported(monkeypatch):
+    await reset_model_client_caches()
+    server = install_fake_server(monkeypatch, FakeModelServer())
+    server.add_reply(text="Hello", fault=StreamFault.cut(after=1))
+
+    try:
+        message = await _call(_model(), stream=False)
+    finally:
+        await reset_model_client_caches()
+
+    assert message.content == "Hello"
+    assert server.unfired_faults == ["StreamFault.cut(after=1) never fires on a reply that is not streamed"]
