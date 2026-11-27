@@ -8,8 +8,10 @@ fake server, on the plain call path and on the streaming path. Both modes must
 make the same tool call, show the model the same conversation, give the same
 answer, and never send the other protocol's keys.
 
-The last test records a known gap as it is today: a browser screenshot reaches
-a Chat model only as a text placeholder.
+The last two tests record known gaps as they are today: a browser screenshot
+reaches a Chat model only as a text placeholder, and an MCP tool's audio and
+file content reaches it as text with the base64 data inside. Both stub the MCP
+session through the client's private ``_session``, so no MCP server runs.
 """
 
 from __future__ import annotations
@@ -21,10 +23,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from mcp.types import CallToolResult, ImageContent
+from mcp.types import AudioContent, BlobResourceContents, CallToolResult, EmbeddedResource, ImageContent
 
 from openjiuwen.core.foundation.llm import Model, ModelClientConfig, ModelRequestConfig
-from openjiuwen.core.foundation.tool import LocalFunction, McpServerConfig, McpToolCard, ToolCard
+from openjiuwen.core.foundation.tool import LocalFunction, McpServerConfig, McpToolCard, StdioClient, ToolCard
 from openjiuwen.core.foundation.tool.mcp.base import MCPTool
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.single_agent.agents.react_agent import ReActAgent, ReActAgentConfig
@@ -40,6 +42,9 @@ _SYSTEM_PROMPT = "You are a camera bot."
 _QUERY = "Take a picture of a cat."
 _IMAGE_URL = "data:image/png;base64,iVBORw0KGgo="
 _ANSWER = "A cat sits on a mat."
+_CAMERA_PARAMS = {"type": "object", "properties": {"label": {"type": "string"}}, "required": ["label"]}
+_AUDIO_BASE64 = "UklGRiQAAABXQVZF"  # the start of a WAV file
+_PDF_BASE64 = "JVBERi0xLjQK"  # the start of a PDF file
 
 # Top-level request keys that only one protocol uses.
 _CHAT_ONLY_KEYS = frozenset(
@@ -134,6 +139,15 @@ def _conversation(body: dict[str, Any]) -> list[tuple]:
     return shown
 
 
+def _offered_tools(body: dict[str, Any]) -> tuple[list[tuple], Any]:
+    """The tools the model is offered and the tool choice, the same way for both protocols."""
+    tools = []
+    for tool in body.get("tools") or []:
+        function = tool.get("function", tool)  # Chat nests the definition; Responses does not
+        tools.append((function["name"], function.get("description"), function.get("parameters")))
+    return tools, body.get("tool_choice")
+
+
 def _keys_and_types(value: Any, keys: set[str], types: set[str]) -> None:
     if isinstance(value, dict):
         keys.update(value)
@@ -164,7 +178,7 @@ async def _run_camera_task(fake_model_server, api_mode: Optional[str], *, stream
         id=f"take_picture_{suffix}",
         name="take_picture",
         description="Take a picture of something.",
-        input_params={"type": "object", "properties": {"label": {"type": "string"}}, "required": ["label"]},
+        input_params=_CAMERA_PARAMS,
     )
     agent = _agent(f"camera_agent_{suffix}", api_mode, prompt_template=[{"role": "system", "content": _SYSTEM_PROMPT}])
     Runner.resource_mgr.add_tool(LocalFunction(card=card, func=take_picture), tag=agent.card.id)
@@ -190,6 +204,9 @@ async def test_camera_task_is_the_same_in_chat_and_responses_mode(fake_model_ser
     assert chat_answer == responses_answer == _ANSWER
     assert chat_pictures == responses_pictures == ["cat"]
     assert [_conversation(body) for body in chat_bodies] == [_conversation(body) for body in responses_bodies]
+    assert [_offered_tools(body) for body in chat_bodies] == [_offered_tools(body) for body in responses_bodies]
+    camera_tool = ("take_picture", "Take a picture of something.", _CAMERA_PARAMS)
+    assert _offered_tools(chat_bodies[0]) == ([camera_tool], "auto")
     assert _conversation(chat_bodies[-1]) == [
         ("system", _SYSTEM_PROMPT),
         ("user", _QUERY),
@@ -256,3 +273,46 @@ async def test_browser_screenshot_reaches_chat_as_text_today(fake_model_server, 
     last_request = fake_model_server.requests[-1].body
     assert _conversation(last_request)[-1] == ("tool result", "call_1", "[binary content: image/png]")
     assert not [item for item in _conversation(last_request) if item[1:2] == ("image",)]
+
+
+@pytest.mark.asyncio
+async def test_mcp_audio_and_file_reach_chat_as_base64_text_today(fake_model_server, runner):
+    # Known gap, recorded as it is: an MCP tool's audio and file content
+    # becomes tool text with the base64 data inside, and no audio or file part
+    # reaches the model. A later change replaces the data with extracted text
+    # or a note and updates this test.
+    client = StdioClient(
+        McpServerConfig(
+            server_id="recorder", server_name="recorder", server_path="stdio://recorder", client_type="stdio",
+        )
+    )
+    files = CallToolResult(
+        content=[
+            AudioContent(type="audio", data=_AUDIO_BASE64, mimeType="audio/wav"),
+            EmbeddedResource(
+                type="resource",
+                resource=BlobResourceContents(uri="file:///report.pdf", mimeType="application/pdf", blob=_PDF_BASE64),
+            ),
+        ]
+    )
+    client._session = SimpleNamespace(call_tool=AsyncMock(return_value=files))
+    card = McpToolCard(
+        id="recorder_fetch_files_gap",
+        name="fetch_files",
+        server_name="recorder",
+        description="Fetch a recording and a report.",
+        input_params={"type": "object", "properties": {}},
+    )
+    agent = _agent("mcp_files_gap_agent", None)
+    Runner.resource_mgr.add_tool(MCPTool(client, card), tag=agent.card.id)
+    agent.ability_manager.add(card)
+    fake_model_server.add_reply(tool_calls=[FakeToolCall(name="fetch_files")])
+    fake_model_server.add_reply(text="I cannot open these.")
+    try:
+        await _answer(agent, "Fetch the recording and the report.", streaming=False, conversation_id="mcp_files_gap")
+    finally:
+        Runner.resource_mgr.remove_tool(card.id)
+
+    kind, call_id, text = _conversation(fake_model_server.requests[-1].body)[-1]
+    assert (kind, call_id) == ("tool result", "call_1")
+    assert _AUDIO_BASE64 in text and _PDF_BASE64 in text
